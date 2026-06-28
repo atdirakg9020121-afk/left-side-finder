@@ -109,6 +109,7 @@
 
 <div id="controls">
   <label><input type="checkbox" id="voiceOn"> 🔊 音声案内</label>
+  <label><input type="checkbox" id="onlyRoad" checked> 今の道だけ</label>
   <label><input type="checkbox" id="showRight" checked> 右も表示</label>
   <label>範囲
     <select id="radius">
@@ -153,6 +154,33 @@ let speed = null;          // m/s
 let lastFetchPos = null;   // 最後に施設を取得した位置
 let facilityMarkers = [];
 let facilities = [];       // 取得済み施設 [{lat,lng,name,type}]
+let roads = [];            // 取得済み道路 [{name, pts:[{lat,lng},...]}] pts=ポリラインの頂点列
+let currentRoad = null;    // 今いる道路 {road, ...} （rebuildFacilitiesで毎回特定）
+let onlyCurrentRoad = true; // 「今いる道路だけ」表示するか
+// 道路ライン中心からこの距離(m)以内の施設だけを「今いる道路沿い」とみなす。
+// OSMの道路ラインは中心線で、店は駐車場/歩道の奥(建物)にあるため中心線から離れる。
+// その離れ具合は道路の規模で大きく違う：
+//   都心の裏道(residential)は店が歩道の際まで来るので30m弱で足りるが、
+//   郊外バイパス(trunk/primary)は片側2車線＋分離帯＋広い駐車場で、
+//   道沿いのGS/コンビニでも中心線から45〜70m離れる(実測:国道119号で46m)。
+// 一律45mだと都心は綺麗だが郊外で道沿いの店を取りこぼす。そこで道路種別ごとに変える。
+function roadSideThresh(hw) {
+  switch (hw) {
+    case 'motorway': case 'trunk': case 'primary': return 75; // 幹線・バイパス：広い
+    case 'secondary':                              return 60;
+    case 'tertiary': case 'unclassified':          return 50;
+    default:                                        return 40; // residential/service等：狭い
+  }
+}
+// 自分から道路ラインがこれ以上(m)離れていたら「その道に乗っていない」とみなす。
+// 幹線は車線が多く中心線から自車も離れるので、こちらも種別で少し緩める。
+function onRoadMax(hw) {
+  switch (hw) {
+    case 'motorway': case 'trunk': case 'primary': return 45;
+    case 'secondary':                              return 38;
+    default:                                        return 30;
+  }
+}
 // 描画コアレス＆ピン再生成の抑制用
 let renderScheduled = false;
 let facDirty = true;       // 施設ピンの再生成が必要か
@@ -213,6 +241,115 @@ function currentHeading() {
   return { value: null, source: '取得中' };
 }
 
+// ---------- 道路（今いる道路の特定・線への距離） ----------
+// 緯度経度の小さな範囲を平面近似する。基準点(lat0)まわりでメートル直交座標へ変換。
+// x=東向き(m), y=北向き(m)。点と線分の最短距離計算に使う。
+function toXY(lat, lng, lat0) {
+  const mPerDegLat = 111320;
+  const mPerDegLng = 111320 * Math.cos(toRad(lat0));
+  return { x: lng * mPerDegLng, y: lat * mPerDegLat };
+}
+
+// 点Pと線分AB（XY座標, m）の最短距離(m)。along=AB上の最近点の位置(0..1)も返す。
+function pointSegDist(p, a, b) {
+  const abx = b.x - a.x, aby = b.y - a.y;
+  const apx = p.x - a.x, apy = p.y - a.y;
+  const ab2 = abx * abx + aby * aby;
+  let t = ab2 > 0 ? (apx * abx + apy * aby) / ab2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx = a.x + abx * t, cy = a.y + aby * t;
+  const dx = p.x - cx, dy = p.y - cy;
+  return { dist: Math.hypot(dx, dy), t };
+}
+
+// 1本のポリライン(pts)への最短距離(m)とその最近セグメント方位を返す。内部用。
+function distToPts(p, pts, lat0) {
+  let best = { dist: Infinity, segBearing: null };
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = toXY(pts[i].lat, pts[i].lng, lat0);
+    const b = toXY(pts[i + 1].lat, pts[i + 1].lng, lat0);
+    const r = pointSegDist(p, a, b);
+    if (r.dist < best.dist) {
+      best.dist = r.dist;
+      best.segBearing = bearing(pts[i].lat, pts[i].lng, pts[i + 1].lat, pts[i + 1].lng);
+    }
+  }
+  return best;
+}
+
+// 点(lat,lng)から「道路」への最短距離(m)と最近セグメント方位を返す。
+// road は単一way({pts})でも、複数wayを束ねた合成道路({chains:[pts,...]})でも受ける。
+// lat0は平面近似の基準。
+function distToRoad(lat, lng, road, lat0) {
+  const p = toXY(lat, lng, lat0);
+  const chains = road.chains || [road.pts];
+  let best = { dist: Infinity, segBearing: null };
+  for (const pts of chains) {
+    if (!pts || pts.length < 2) continue;
+    const r = distToPts(p, pts, lat0);
+    if (r.dist < best.dist) best = r;
+  }
+  return best;
+}
+
+// 今いる道路を特定する。OSMでは同じ道路が多数のwayに分断されているため、
+// 中心となる1本を選んだあと「同じ名前のway全部」を束ねて1つの道路として返す。
+// 名前が無い道路は、向きが近く連続する近接wayを束ねる（フォールバック）。
+// 道路に乗っていなければ null。
+function findCurrentRoad(lat, lng, heading) {
+  const p = toXY(lat, lng, lat);
+  // ① 自分に最も近い(かつ進行方向に近い)1本を選ぶ
+  let best = null;
+  for (const road of roads) {
+    if (road.pts.length < 2) continue;
+    const r = distToPts(p, road.pts, lat);
+    if (r.dist > onRoadMax(road.hw)) continue; // 種別ごとの「乗っている」許容距離
+    let headPenalty = 0;
+    if (heading !== null && r.segBearing !== null) {
+      const d = angularDiff(heading, r.segBearing);
+      headPenalty = Math.min(d, 180 - d); // 0..90。平行なら0
+    }
+    // 近さ優先、向きが大きくズレる道は後回し（角を曲がる瞬間の取り違え対策）
+    const score = r.dist + headPenalty * 0.6;
+    if (!best || score < best.score) best = { road, score, segBearing: r.segBearing };
+  }
+  if (!best) return null;
+  const baseHw = best.road.hw; // 中心wayの種別。沿道判定の距離閾値に使う
+
+  // ② 中心wayと同じ道路を束ねる。
+  // 識別キーは name と ref(番号道路)の両方。郊外の国道は区間ごとに
+  // name が変わる(○○バイパス/△△街道/無名)ので、ref を共有する way も同じ道として束ねる。
+  const baseName = best.road.name;
+  const baseRefs = best.road.refs;
+  const hasKey = baseName || baseRefs.length;
+  let chains;
+  if (hasKey) {
+    chains = roads.filter(r => {
+      if (r.pts.length < 2) return false;
+      if (baseName && r.name === baseName) return true;            // 同名
+      if (baseRefs.length && r.refs.some(x => baseRefs.includes(x))) return true; // 同一番号道路
+      return false;
+    }).map(r => r.pts);
+  } else {
+    // name も ref も無い道路：中心wayと向きが平行(±25°)な近接wayを束ねる。
+    // 「近接」＝そのwayのどこかが中心wayの近く(60m以内)にある＝つながっている道。
+    const baseBearing = best.segBearing;
+    chains = roads.filter(r => {
+      if (r.pts.length < 2) return false;
+      if (r === best.road) return true;
+      if (r.name || r.refs.length) return false; // 名前/番号を持つ別の道は別物
+      // 向きの平行性
+      const bb = bearing(r.pts[0].lat, r.pts[0].lng, r.pts[1].lat, r.pts[1].lng);
+      const d = angularDiff(baseBearing, bb);
+      if (Math.min(d, 180 - d) > 25) return false;
+      // 中心wayのどこかと十分近い(連続している)か
+      const rr = distToPts(toXY(r.pts[0].lat, r.pts[0].lng, lat), best.road.pts, lat);
+      return rr.dist <= 60;
+    }).map(r => r.pts);
+  }
+  return { name: baseName || baseRefs.join('/'), hw: baseHw, chains };
+}
+
 // ---------- 音声案内 ----------
 // 距離を聞き取りやすい丸めた言い方にする（50m単位、100以上は端数を丸める）
 function spokenDistance(m) {
@@ -254,6 +391,11 @@ function announceNearby(heading) {
     if (dist > VOICE_RESET) { announced[key] = false; continue; }
 
     if (!activeBrands.has(brandKey(f))) continue; // 凡例で非表示のブランドは読み上げない
+    // 「今いる道路だけ」表示中は、その道沿いの店だけ読み上げる（地図表示と揃える）
+    if (currentRoad) {
+      const rd = distToRoad(f.lat, f.lng, currentRoad, myPos.lat).dist;
+      if (rd > roadSideThresh(currentRoad.hw)) continue;
+    }
 
     const ang = relativeAngle(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
     const isLeft = ang < 0;
@@ -332,26 +474,28 @@ function rotationTick() {
 }
 
 // ---------- 施設取得 (Overpass / OpenStreetMap) ----------
-const FETCH_RADIUS = 5000; // 取得半径(m)。範囲セレクトの最大(5km)に合わせる。表示はこの中から距離フィルタで絞る
+const FETCH_RADIUS = 5000; // 施設の取得半径(m)。範囲セレクトの最大(5km)に合わせる。表示はこの中から距離フィルタで絞る
+const ROAD_FETCH_RADIUS = 600; // 道路の取得半径(m)。「今いる道路」特定が目的なので近場だけで十分・軽い
 async function fetchFacilities(lat, lng) {
+  // 施設(node)と道路(way)を1リクエストで取得。
+  // way の頂点座標も要るので「>;(子ノード展開) + out skel」を付ける。
   const query = `
-    [out:json][timeout:20];
+    [out:json][timeout:25];
     (
       node["shop"="convenience"](around:${FETCH_RADIUS},${lat},${lng});
       node["amenity"="fuel"](around:${FETCH_RADIUS},${lat},${lng});
     );
-    out body;`;
+    out body;
+    way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|road)$"](around:${ROAD_FETCH_RADIUS},${lat},${lng});
+    out body;
+    >;
+    out skel qt;`;
   try {
     const res = await fetch('https://overpass-api.de/api/interpreter', {
       method: 'POST', body: query
     });
     const data = await res.json();
-    facilities = data.elements.map(e => ({
-      lat: e.lat, lng: e.lon,
-      name: e.tags.name || (e.tags.amenity === 'fuel' ? 'ガソリンスタンド' : 'コンビニ'),
-      type: e.tags.amenity === 'fuel' ? 'fuel' : 'conv',
-      hours: e.tags.opening_hours || null
-    }));
+    parseOverpass(data);
     lastFetchPos = { lat, lng };
     facDirty = true; // 新しい施設データなのでピンを必ず作り直す
     setMsg('');
@@ -359,6 +503,35 @@ async function fetchFacilities(lat, lng) {
   } catch (err) {
     setMsg('施設データ取得に失敗（電波/サーバ混雑）。少し待って移動すると再取得します。');
   }
+}
+
+// Overpassの応答(node/way混在)を施設配列と道路配列に分解する。
+function parseOverpass(data) {
+  // ノード座標表（way頂点の解決用）
+  const nodeMap = new Map();
+  for (const e of data.elements) {
+    if (e.type === 'node' && e.lat != null) nodeMap.set(e.id, { lat: e.lat, lng: e.lon });
+  }
+  facilities = data.elements
+    .filter(e => e.type === 'node' && e.tags &&
+            (e.tags.shop === 'convenience' || e.tags.amenity === 'fuel'))
+    .map(e => ({
+      lat: e.lat, lng: e.lon,
+      name: e.tags.name || (e.tags.amenity === 'fuel' ? 'ガソリンスタンド' : 'コンビニ'),
+      type: e.tags.amenity === 'fuel' ? 'fuel' : 'conv',
+      hours: e.tags.opening_hours || null
+    }));
+  roads = data.elements
+    .filter(e => e.type === 'way' && Array.isArray(e.nodes) && e.tags && e.tags.highway)
+    .map(e => ({
+      name: e.tags.name || '',
+      hw: e.tags.highway, // 道路種別。沿道判定の距離閾値を規模で変えるのに使う
+      // 番号道路の識別子(例 "国道4号" や "4;294")。郊外では区間ごとにnameが
+      // バラつく(○○バイパス/△△街道/無名)ので、refを束ねの安定キーに使う。
+      refs: (e.tags.ref || '').split(';').map(s => s.trim()).filter(Boolean),
+      pts: e.nodes.map(id => nodeMap.get(id)).filter(Boolean)
+    }))
+    .filter(r => r.pts.length >= 2);
 }
 
 // ---------- 描画 ----------
@@ -424,12 +597,23 @@ function rebuildFacilities(heading) {
   let leftCount = 0;
   let nearestLeft = null; // 進行方向(前方)で一番近い左側施設 {f, dist}
 
+  // 「今いる道路だけ」表示するなら、自分が乗っている道路を特定する。
+  // 特定できないとき(交差点上・道路データ未取得など)は従来通り全部出す。
+  currentRoad = (onlyCurrentRoad && roads.length)
+    ? findCurrentRoad(myPos.lat, myPos.lng, heading) : null;
+
   if (heading !== null) {
     const labelRot = -currentRotation; // ラベルを水平に保つ逆回転
     facilities.forEach(f => {
       const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
       if (dist > maxDist) return; // 距離フィルタ外は出さない
       if (!activeBrands.has(brandKey(f))) return; // 凡例で非表示にしたブランドは出さない
+      // 「今いる道路だけ」：その道路ラインから一定距離以上離れた施設は別の道沿い→除外。
+      // 許容距離は道路種別による（幹線・バイパスは広いので大きめ）。
+      if (currentRoad) {
+        const rd = distToRoad(f.lat, f.lng, currentRoad, myPos.lat).dist;
+        if (rd > roadSideThresh(currentRoad.hw)) return;
+      }
 
       const ang = relativeAngle(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
       const isLeft = ang < 0;
@@ -654,13 +838,17 @@ function startCompass() {
 Object.assign(window, {
   bearing, distance, relativeSide, relativeAngle, angularDiff, currentHeading, fetchFacilities, render, doRender,
   shortName, spokenDistance, announceNearby, brandColor, openState,
+  distToRoad, distToPts, findCurrentRoad, pointSegDist, toXY, parseOverpass,
+  roadSideThresh, onRoadMax,
   _setFacDirty() { facDirty = true; },
+  _setOnlyRoad(on) { onlyCurrentRoad = on; facDirty = true; },
+  _injectRoads(r) { roads = r; },
   _setVoice(on) { voiceOn = on; },
   _inject(p) { if (p.myPos) myPos = p.myPos; if ('gpsHeading' in p) gpsHeading = p.gpsHeading; if ('speed' in p) speed = p.speed; if ('compassHeading' in p) compassHeading = p.compassHeading; if (p.facilities) facilities = p.facilities; }
 });
 Object.defineProperties(window, {
   _map: { get() { return map; }, configurable: true },
-  _state: { get() { return { myPos, gpsHeading, compassHeading, speed, facilities, currentRotation, facBuildCount }; }, configurable: true }
+  _state: { get() { return { myPos, gpsHeading, compassHeading, speed, facilities, roads, currentRoad, onlyCurrentRoad, currentRotation, facBuildCount }; }, configurable: true }
 });
 
 // ---------- 起動 ----------
@@ -671,6 +859,9 @@ document.getElementById('startBtn').addEventListener('click', () => {
   primeVoice(); // ユーザー操作のうちに音声を解禁(iOS対策)
   startGeo();
   startCompass();
+});
+document.getElementById('onlyRoad').addEventListener('change', e => {
+  onlyCurrentRoad = e.target.checked; facDirty = true; render();
 });
 document.getElementById('showRight').addEventListener('change', () => { facDirty = true; render(); });
 document.getElementById('radius').addEventListener('change', () => { facDirty = true; render(); });
