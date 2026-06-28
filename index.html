@@ -13,9 +13,11 @@
      #mapwrap を進行方向に合わせて回転させる。 */
   #mapwrap {
     position: absolute; z-index: 1;
-    /* 画面中心を基準に、対角線をカバーするサイズ(150vmax)を中央配置 */
+    /* 画面中心を基準に、対角線をカバーするサイズ(150vmax)を配置。
+       自車を画面の下寄り(66%)に置き、進行方向(前方)を広く見せる＝カーナビ式。
+       回転軸も自車になる(中心=自車位置)。 */
     width: 150vmax; height: 150vmax;
-    top: 50%; left: 50%;
+    top: 66%; left: 50%;
     transform-origin: center center;
     transition: transform 0.3s ease-out;
   }
@@ -63,22 +65,27 @@
   .fac-label { font-size: 12px; font-weight: 700; color: #14532d;
                background: rgba(255,255,255,0.9); border-radius: 4px;
                padding: 1px 5px; margin-top: -10px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
-  .fac-label small { font-weight: 400; color: #2a7; margin-left: 4px; font-size: 10px; }
+  .fac-label small { font-weight: 400; color: #555; margin-left: 4px; font-size: 10px; }
+  /* 営業状態バッジ */
+  .badge { font-style: normal; font-size: 10px; font-weight: 700; color: #fff;
+           border-radius: 3px; padding: 0 4px; margin-left: 4px; }
+  .badge.b24 { background: #1565c0; }      /* 24時間=青 */
+  .badge.bopen { background: #2e7d32; }    /* 営業中=緑 */
+  .badge.bclosed { background: #9e9e9e; }  /* 営業時間外=灰 */
 
-  /* 自分マーカー：中心の青丸＋進行方向を指す三角 */
+  /* 自分マーカー：中心の青丸＋進行方向を指す大きめの三角（手前=上に突出） */
   .me-icon { position: relative; }
   .me-dot {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
-    width: 16px; height: 16px; border-radius: 50%;
-    background: #2196f3; border: 2px solid #fff; box-shadow: 0 0 3px rgba(0,0,0,0.5);
+    width: 18px; height: 18px; border-radius: 50%;
+    background: #1976d2; border: 3px solid #fff; box-shadow: 0 0 4px rgba(0,0,0,0.6);
   }
-  /* 三角の根元を丸の中心(アイコン中心 20,20)に合わせ、そこを軸に回す。
-     アイコン40x40の中心が(20,20)。三角は高さ16pxを上に伸ばし、根元(下端)を中心に置く。 */
+  /* 三角の根元を丸の中心(アイコン中心 20,20)に合わせ、そこを軸に回す。大きく目立たせる。 */
   .me-arrow {
-    position: absolute; left: 20px; top: 4px; margin-left: -8px; /* 三角(幅16)の中心を x=20(丸中心)に合わせる */
-    transform-origin: 8px 16px;          /* 三角の下端中央(=丸中心) を回転軸に */
-    width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent;
-    border-bottom: 16px solid #2196f3; filter: drop-shadow(0 0 2px rgba(0,0,0,0.6));
+    position: absolute; left: 20px; top: -8px; margin-left: -12px; /* 三角(幅24)の中心を x=20 に */
+    transform-origin: 12px 28px;          /* 三角の下端中央(=丸中心) を回転軸に */
+    width: 0; height: 0; border-left: 12px solid transparent; border-right: 12px solid transparent;
+    border-bottom: 28px solid #1976d2; filter: drop-shadow(0 0 2px #fff) drop-shadow(0 0 2px rgba(0,0,0,0.7));
   }
 </style>
 </head>
@@ -96,10 +103,21 @@
 
 <div id="controls">
   <label><input type="checkbox" id="voiceOn"> 🔊 音声案内</label>
-  <label><input type="checkbox" id="showRight" checked> 右側も薄く表示</label>
+  <label><input type="checkbox" id="showRight" checked> 右も表示</label>
+  <label>範囲
+    <select id="radius">
+      <option value="200">200m</option>
+      <option value="300">300m</option>
+      <option value="500" selected>500m</option>
+      <option value="800">800m</option>
+      <option value="1000">1km</option>
+    </select>
+  </label>
   <div class="legend">
-    <span><span class="dot left"></span>左</span>
-    <span><span class="dot right"></span>右</span>
+    <span><span class="dot" style="background:#ee7b00"></span>セブン</span>
+    <span><span class="dot" style="background:#0068b7"></span>ローソン</span>
+    <span><span class="dot" style="background:#00a040"></span>ファミマ</span>
+    <span><span class="dot" style="background:#e03131"></span>GS</span>
   </div>
 </div>
 
@@ -259,13 +277,13 @@ function applyMapRotation(heading) {
 }
 
 // ---------- 施設取得 (Overpass / OpenStreetMap) ----------
+const FETCH_RADIUS = 1000; // 取得半径(m)。表示はこの中から距離フィルタで絞る
 async function fetchFacilities(lat, lng) {
-  const radius = 800; // m
   const query = `
     [out:json][timeout:20];
     (
-      node["shop"="convenience"](around:${radius},${lat},${lng});
-      node["amenity"="fuel"](around:${radius},${lat},${lng});
+      node["shop"="convenience"](around:${FETCH_RADIUS},${lat},${lng});
+      node["amenity"="fuel"](around:${FETCH_RADIUS},${lat},${lng});
     );
     out body;`;
   try {
@@ -276,7 +294,8 @@ async function fetchFacilities(lat, lng) {
     facilities = data.elements.map(e => ({
       lat: e.lat, lng: e.lon,
       name: e.tags.name || (e.tags.amenity === 'fuel' ? 'ガソリンスタンド' : 'コンビニ'),
-      type: e.tags.amenity === 'fuel' ? 'fuel' : 'conv'
+      type: e.tags.amenity === 'fuel' ? 'fuel' : 'conv',
+      hours: e.tags.opening_hours || null
     }));
     lastFetchPos = { lat, lng };
     setMsg('');
@@ -314,24 +333,31 @@ function render() {
   facilityMarkers.forEach(m => map.removeLayer(m));
   facilityMarkers = [];
   const showRight = document.getElementById('showRight').checked;
+  const maxDist = Number(document.getElementById('radius').value); // 距離フィルタ(m)
   let leftCount = 0;
 
   if (h.value !== null) {
     // 地図回転を打ち消してラベルを常に水平に保つための逆回転角
     const labelRot = -currentRotation;
     facilities.forEach(f => {
-      const b = bearing(myPos.lat, myPos.lng, f.lat, f.lng);
-      const side = relativeSide(h.value, b);
       const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
-      if (side === 'left') leftCount++;
-      if (side === 'right' && !showRight) return;
+      if (dist > maxDist) return; // 距離フィルタ外は出さない
 
+      const side = relativeSide(h.value, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
       const isLeft = side === 'left';
-      const color = isLeft ? '#2ecc71' : '#888';
+      if (isLeft) leftCount++;
+      if (!isLeft && !showRight) return;
+
+      const color = brandColor(f);          // 色＝チェーン
       const typeLabel = f.type === 'fuel' ? '⛽' : '🏪';
+      const os = openState(f);
+      // 営業バッジ（判定できた時だけ）
+      const badge = os.state === '24h'   ? `<i class="badge b24">24h</i>`
+                  : os.state === 'open'  ? `<i class="badge bopen">営</i>`
+                  : os.state === 'closed'? `<i class="badge bclosed">×</i>` : '';
       // 左側だけ名前ラベルを出す。右側(薄表示)は点だけでごちゃつきを防ぐ。
       const labelHtml = isLeft
-        ? `<span class="fac-label">${typeLabel}${shortName(f)}<small>${Math.round(dist)}m</small></span>`
+        ? `<span class="fac-label">${typeLabel}${shortName(f)}${badge}<small>${Math.round(dist)}m</small></span>`
         : '';
       const icon = L.divIcon({
         className: 'fac-icon',
@@ -340,7 +366,8 @@ function render() {
         iconSize: [0, 0], iconAnchor: [0, 0]
       });
       const m = L.marker([f.lat, f.lng], { icon, interactive: true, zIndexOffset: isLeft ? 500 : 0 }).addTo(map);
-      m.bindPopup(`${typeLabel} ${f.name}<br>${isLeft ? '左' : '右'}側 / ${Math.round(dist)}m`);
+      const hoursText = f.hours ? `<br>${f.hours}` : '';
+      m.bindPopup(`${typeLabel} ${f.name}<br>${isLeft ? '左' : '右'}側 / ${Math.round(dist)}m${os.label ? ' / ' + os.label : ''}${hoursText}`);
       facilityMarkers.push(m);
     });
   }
@@ -367,6 +394,75 @@ function shortName(f) {
   // ガソスタや無名はそのまま(長ければ省略)
   if (!n) return f.type === 'fuel' ? 'GS' : '店';
   return n.length > 8 ? n.slice(0, 8) + '…' : n;
+}
+
+// ブランド別の色を返す（色＝チェーン。左右は大きさ/濃さ/ラベルで区別）
+function brandColor(f) {
+  const n = f.name || '';
+  if (f.type === 'fuel') return '#e03131';                       // ガソスタ=赤
+  if (/セブン([-‐ー]?イレブン)?/.test(n)) return '#ee7b00';      // セブン=オレンジ
+  if (/ローソン/.test(n))                 return '#0068b7';      // ローソン=青
+  if (/ファミリーマート|ファミマ/.test(n)) return '#00a040';     // ファミマ=緑
+  if (/ミニストップ/.test(n))             return '#f6c700';      // ミニストップ=黄
+  if (/デイリーヤマザキ/.test(n))     return '#e8531b';   // デイリー=朱
+  if (/セイコーマート/.test(n))       return '#1b9e5a';   // セイコマ=深緑
+  return '#7a5ad6';                                        // その他コンビニ=紫
+}
+
+// 営業状態を判定する。{state:'24h'|'open'|'closed'|'unknown', label}
+// opening_hours は仕様が複雑なので、確実に判定できる形だけ open/closed を返し、
+// それ以外は unknown として「営業中」等と断定しない（誤案内を避ける）。
+function openState(f, now = new Date()) {
+  const h = f.hours;
+  if (!h) return { state: 'unknown', label: '' };
+  const s = h.trim();
+  if (/^24\/7$/.test(s)) return { state: '24h', label: '24h' };
+
+  // 今日の曜日に該当する時間範囲を集める
+  const days = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+  const today = days[now.getDay()];
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+
+  // セミコロン区切りの各ルールを見る
+  let matchedAny = false;
+  for (const rawRule of s.split(';')) {
+    const rule = rawRule.trim();
+    if (!rule) continue;
+    if (/^24\/7$/.test(rule)) return { state: '24h', label: '24h' };
+
+    // 曜日指定を抽出（例: "Mo-Fr 07:00-23:00" / "Mo,We 09:00-18:00" / "07:00-22:00"）
+    const m = rule.match(/^([A-Za-z,\-\s]+?)?\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/);
+    if (!m) return { state: 'unknown', label: '' }; // 解釈できない形は断定しない
+    const dayPart = (m[1] || '').trim();
+    if (dayPart && !dayMatches(dayPart, today, days)) continue;
+
+    matchedAny = true;
+    const start = toMin(m[2]);
+    let end = toMin(m[3]);
+    const overnight = end <= start; // 22:00-06:00 のような日跨ぎ
+    const open = overnight ? (nowMin >= start || nowMin < end)
+                           : (nowMin >= start && nowMin < end);
+    if (open) return { state: 'open', label: '営業中' };
+  }
+  // 今日の該当ルールはあったが時間外
+  if (matchedAny) return { state: 'closed', label: '営業時間外' };
+  return { state: 'unknown', label: '' };
+}
+function toMin(hhmm) { const [h, m] = hhmm.split(':').map(Number); return h * 60 + m; }
+function dayMatches(part, today, days) {
+  const ti = days.indexOf(today);
+  for (const tok of part.split(',')) {
+    const t = tok.trim();
+    const range = t.match(/^([A-Za-z]{2})\s*-\s*([A-Za-z]{2})$/);
+    if (range) {
+      let a = days.indexOf(range[1]), b = days.indexOf(range[2]);
+      if (a < 0 || b < 0) continue;
+      // 週をまたぐ範囲(例 Fr-Mo)も考慮
+      if (a <= b) { if (ti >= a && ti <= b) return true; }
+      else { if (ti >= a || ti <= b) return true; }
+    } else if (days.indexOf(t) === ti) return true;
+  }
+  return false;
 }
 
 function setMsg(t) { document.getElementById('msg').textContent = t; }
@@ -452,7 +548,7 @@ function startCompass() {
 // 注: Object.assign だと getter が即時評価され値が固定されるため、defineProperties で本物のgetterにする
 Object.assign(window, {
   bearing, distance, relativeSide, relativeAngle, currentHeading, fetchFacilities, render,
-  shortName, spokenDistance, announceNearby,
+  shortName, spokenDistance, announceNearby, brandColor, openState,
   _setVoice(on) { voiceOn = on; },
   _inject(p) { if (p.myPos) myPos = p.myPos; if ('gpsHeading' in p) gpsHeading = p.gpsHeading; if ('speed' in p) speed = p.speed; if ('compassHeading' in p) compassHeading = p.compassHeading; if (p.facilities) facilities = p.facilities; }
 });
@@ -470,6 +566,7 @@ document.getElementById('startBtn').addEventListener('click', () => {
   startCompass();
 });
 document.getElementById('showRight').addEventListener('change', render);
+document.getElementById('radius').addEventListener('change', render);
 document.getElementById('voiceOn').addEventListener('change', e => {
   voiceOn = e.target.checked;
   if (voiceOn) { primeVoice(); speak('音声案内をオンにしました'); }
