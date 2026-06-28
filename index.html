@@ -108,11 +108,11 @@
   <label><input type="checkbox" id="showRight" checked> 右も表示</label>
   <label>範囲
     <select id="radius">
-      <option value="200">200m</option>
-      <option value="300">300m</option>
       <option value="500" selected>500m</option>
-      <option value="800">800m</option>
       <option value="1000">1km</option>
+      <option value="2000">2km</option>
+      <option value="3000">3km</option>
+      <option value="5000">5km</option>
     </select>
   </label>
   <div class="legend">
@@ -323,7 +323,7 @@ function rotationTick() {
 }
 
 // ---------- 施設取得 (Overpass / OpenStreetMap) ----------
-const FETCH_RADIUS = 1000; // 取得半径(m)。表示はこの中から距離フィルタで絞る
+const FETCH_RADIUS = 5000; // 取得半径(m)。範囲セレクトの最大(5km)に合わせる。表示はこの中から距離フィルタで絞る
 async function fetchFacilities(lat, lng) {
   const query = `
     [out:json][timeout:20];
