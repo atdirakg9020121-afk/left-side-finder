@@ -215,23 +215,57 @@ function render() {
 function setMsg(t) { document.getElementById('msg').textContent = t; }
 
 // ---------- センサー ----------
+// GPSエラーコードを日本語の原因＋対処に変換
+function geoErrorText(err) {
+  switch (err.code) {
+    case 1: return '位置情報がブロックされています。ブラウザのこのサイトの設定で位置情報を「許可」にし、ページを再読み込みしてください。';
+    case 2: return '位置を特定できません（電波/GPSが弱い）。屋外や窓際で再度お試しください。';
+    case 3: return '位置取得がタイムアウトしました。屋内だとGPSが届きにくいです。窓際/屋外で再試行します…';
+    default: return '位置情報の取得に失敗: ' + (err.message || '不明なエラー');
+  }
+}
+
+// 取得した位置を反映する共通処理
+function applyPosition(pos) {
+  myPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+  if (pos.coords.heading !== null && !isNaN(pos.coords.heading)) gpsHeading = pos.coords.heading;
+  if (pos.coords.speed !== null && !isNaN(pos.coords.speed)) speed = pos.coords.speed;
+
+  if (!meMarker) map.setView([myPos.lat, myPos.lng], 16);
+
+  // 一定距離移動したら施設を再取得
+  if (!lastFetchPos || distance(myPos.lat, myPos.lng, lastFetchPos.lat, lastFetchPos.lng) > 300) {
+    fetchFacilities(myPos.lat, myPos.lng);
+  }
+  setMsg('');
+  render();
+}
+
 function startGeo() {
   if (!navigator.geolocation) { setMsg('この端末は位置情報に対応していません'); return; }
-  navigator.geolocation.watchPosition(pos => {
-    myPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-    if (pos.coords.heading !== null && !isNaN(pos.coords.heading)) gpsHeading = pos.coords.heading;
-    if (pos.coords.speed !== null && !isNaN(pos.coords.speed)) speed = pos.coords.speed;
 
-    if (!meMarker) map.setView([myPos.lat, myPos.lng], 16);
+  setMsg('位置情報を取得中…（屋内だと時間がかかります）');
 
-    // 一定距離移動したら施設を再取得
-    if (!lastFetchPos || distance(myPos.lat, myPos.lng, lastFetchPos.lat, lastFetchPos.lng) > 300) {
-      fetchFacilities(myPos.lat, myPos.lng);
-    }
-    render();
-  }, err => {
-    setMsg('位置情報の取得に失敗: ' + err.message);
-  }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
+  // ① まず低精度(Wi-Fi/基地局)で素早く現在地を確保する。屋内でもだいたい取れる。
+  navigator.geolocation.getCurrentPosition(
+    pos => applyPosition(pos),
+    err => { setMsg(geoErrorText(err)); },
+    { enableHighAccuracy: false, maximumAge: 60000, timeout: 30000 }
+  );
+
+  // ② 並行して高精度GPSを継続監視。取れ次第こちらで精度が上がる。
+  //    高精度が屋内で失敗してもタイムアウト表示するだけで、①の位置は保持される。
+  navigator.geolocation.watchPosition(
+    pos => applyPosition(pos),
+    err => {
+      // ブロック(code1)は待っても直らないので常にはっきり表示
+      if (err.code === 1) { setMsg(geoErrorText(err)); return; }
+      // それ以外(タイムアウト等)は、既に位置が取れていれば控えめに
+      if (myPos) setMsg('高精度GPSは取得待ち（' + geoErrorText(err) + '）');
+      else setMsg(geoErrorText(err));
+    },
+    { enableHighAccuracy: true, maximumAge: 1000, timeout: 30000 }
+  );
 }
 
 function startCompass() {
