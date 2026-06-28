@@ -33,6 +33,8 @@
        自車を画面の下寄り(66%)に置き、進行方向(前方)を広く見せる＝カーナビ式。
        回転軸も自車になる(中心=自車位置)。 */
     width: 150vmax; height: 150vmax;
+    /* top(自車の下寄せ量)は TUNE.carTop% を applyCarTop() がJSで設定する（実車調整で可変）。
+       既定85%。値が大きいほど自車が画面下＝前方を広く見せる。 */
     top: 85%; left: 50%;
     transform-origin: center center;
     /* 回転はJS側で毎フレーム補間する(rotationTick)。CSS transitionは
@@ -40,6 +42,32 @@
        自車位置を画面の下(78%)へ寄せ、前方を広く＝矢印は手前。 */
   }
   #map { width: 100%; height: 100%; }
+
+  /* 実車調整UI：走行中にスライダーで微調整→値はlocalStorageに保存。
+     運転中の操作は危険なので「停車中に開く」想定の小さなパネル。 */
+  #tuneBtn {
+    position: absolute; right: 10px; bottom: 64px; z-index: 1500;
+    width: 44px; height: 44px; border-radius: 50%; border: none;
+    background: rgba(20,20,30,0.85); color: #fff; font-size: 22px;
+    box-shadow: 0 3px 12px rgba(0,0,0,0.35); cursor: pointer;
+  }
+  #tunePanel {
+    position: absolute; right: 10px; bottom: 116px; z-index: 1500;
+    width: min(82vw, 290px); background: rgba(20,20,30,0.92); color: #fff;
+    border-radius: 14px; padding: 12px 14px; backdrop-filter: blur(4px);
+    box-shadow: 0 6px 24px rgba(0,0,0,0.4); display: none;
+  }
+  #tunePanel.open { display: block; }
+  #tunePanel h4 { font-size: 13px; margin-bottom: 8px; font-weight: 700; }
+  #tunePanel .trow { margin: 10px 0; font-size: 12px; }
+  #tunePanel .trow .lab { display: flex; justify-content: space-between; margin-bottom: 3px; }
+  #tunePanel .trow .lab b { color: #6cf; }
+  #tunePanel input[type=range] { width: 100%; }
+  #tunePanel .hint { font-size: 10px; color: #9ab; }
+  #tuneReset {
+    margin-top: 6px; width: 100%; padding: 8px; border: none; border-radius: 8px;
+    background: #444; color: #fff; font-size: 12px; cursor: pointer;
+  }
 
   /* 自分の青い三角は地図と一緒に回らず、常に画面の上(進行方向)を指す。
      地図回転を打ち消すため、矢印アイコン自身を逆回転させる(JSで指定)。 */
@@ -123,6 +151,33 @@
 
 <button id="startBtn">スタート（位置情報を許可）</button>
 
+<!-- 実車調整UI：停車中に⚙を押してスライダーで微調整。値は自動保存され次回も維持。 -->
+<button id="tuneBtn" title="実車調整">⚙</button>
+<div id="tunePanel">
+  <h4>🚗 実車調整（停車中に）</h4>
+  <div class="trow">
+    <div class="lab"><span>回転の機敏さ</span><b id="vRotEase"></b></div>
+    <input type="range" id="sRotEase" min="0.05" max="0.5" step="0.01">
+    <div class="hint">大=機敏に追従／小=ゆっくり滑らか</div>
+  </div>
+  <div class="trow">
+    <div class="lab"><span>自車の下寄せ</span><b id="vCarTop"></b></div>
+    <input type="range" id="sCarTop" min="60" max="95" step="1">
+    <div class="hint">大=自車が手前／前方を広く表示</div>
+  </div>
+  <div class="trow">
+    <div class="lab"><span>コンパス平滑化</span><b id="vCompass"></b></div>
+    <input type="range" id="sCompass" min="0" max="0.9" step="0.05">
+    <div class="hint">大=震え減るが追従が遅れる</div>
+  </div>
+  <div class="trow">
+    <div class="lab"><span>ラベル間隔</span><b id="vLabelGap"></b></div>
+    <input type="range" id="sLabelGap" min="20" max="80" step="2">
+    <div class="hint">大=ラベルを多く間引く（重なり防止）</div>
+  </div>
+  <button id="tuneReset">既定値に戻す</button>
+</div>
+
 <div id="controls">
   <label><input type="checkbox" id="voiceOn"> 🔊 音声案内</label>
   <label><input type="checkbox" id="onlyRoad" checked> 今の道だけ</label>
@@ -165,7 +220,23 @@ const VOICE_COOLDOWN = 3500; // 連続発話の最小間隔(ms)
 const VOICE_FWD_DEG = 100; // 進行方向からこの角度以内を「前方」とみなす
 let myPos = null;          // {lat, lng}
 let gpsHeading = null;     // GPS由来の進行方位(度)
-let compassHeading = null; // コンパス由来の方位(度)
+let compassHeading = null; // コンパス由来の方位(度)。平滑化後の値
+let compassRaw = null;     // コンパスの生値（平滑化前。デバッグ・初期化用）
+
+// ---------- 実車調整パラメータ（走行中にスライダーで調整→localStorage保存）----------
+// まだ実車検証していないため、ベスト値は実走で詰める。既定値は擬似走行での暫定。
+const TUNE_KEY = 'lsf_tune_v1';
+const TUNE_DEFAULTS = {
+  rotEase: 0.18,      // 回転補間の機敏さ 0..1（大=機敏/小=滑らか）
+  carTop: 85,         // 自車の下寄せ量 %（大ほど自車が画面下＝前方を広く）
+  compass: 0.35,      // コンパス平滑化 0..0.9（大ほど強く均す＝震え減/遅延増）
+  labelGap: 46,       // ラベル間引きの最小画面距離 px（大ほど間引く）
+};
+let TUNE = (function () {
+  try { return Object.assign({}, TUNE_DEFAULTS, JSON.parse(localStorage.getItem(TUNE_KEY)) || {}); }
+  catch (e) { return Object.assign({}, TUNE_DEFAULTS); }
+})();
+function saveTune() { try { localStorage.setItem(TUNE_KEY, JSON.stringify(TUNE)); } catch (e) {} }
 let speed = null;          // m/s
 let lastFetchPos = null;   // 最後に施設を取得した位置
 let facilityMarkers = [];
@@ -207,7 +278,7 @@ const FAC_MOVE_THRESH = 25;    // これ以上(m)動いたらピン再生成
 // ラベル間引き：既に置いたラベルとの画面距離(px)がこれ未満なら、後から来た(=より遠い)
 // 施設のラベルを省いてドットだけにする。都心でラベルが重なって読めない問題への対応。
 // 近い施設ほど優先してラベルを残す（運転中は手前の店の方が重要なため）。
-const LABEL_MIN_GAP_PX = 46;
+// 閾値は TUNE.labelGap（実車調整UIで変更）。
 
 // ---------- ユーティリティ ----------
 const toRad = d => d * Math.PI / 180;
@@ -465,19 +536,25 @@ function setTargetRotation(heading) {
   targetRotation = targetRotation + diff;
 }
 
+// 自車の下寄せ量(TUNE.carTop%)を #mapwrap に反映（実車調整で可変）
+function applyCarTop() {
+  const wrap = document.getElementById('mapwrap');
+  if (wrap) wrap.style.top = TUNE.carTop + '%';
+}
+
 // 毎フレーム、現在角を目標角へ少しずつ寄せて地図を滑らかに回す。
 // コンパスが飛び飛びに発火しても、描画はフレーム単位で連続するためカクつかない。
-const ROT_EASE = 0.18;     // 0..1。大きいほど機敏、小さいほど滑らか
 function rotationTick() {
   const wrap = document.getElementById('mapwrap');
   if (wrap) {
+    const ease = TUNE.rotEase; // 実車調整で可変（大=機敏/小=滑らか）
     if (!headingKnown) {
       // 方向不明：北上に戻す（こちらも滑らかに）。中央配置は常に維持。
       const diff = 0 - currentRotation;
-      currentRotation = Math.abs(diff) < 0.05 ? 0 : currentRotation + diff * ROT_EASE;
+      currentRotation = Math.abs(diff) < 0.05 ? 0 : currentRotation + diff * ease;
     } else {
       const diff = targetRotation - currentRotation;
-      currentRotation = Math.abs(diff) < 0.05 ? targetRotation : currentRotation + diff * ROT_EASE;
+      currentRotation = Math.abs(diff) < 0.05 ? targetRotation : currentRotation + diff * ease;
     }
     wrap.style.transform = `translate(-50%, -50%) rotate(${currentRotation}deg)`;
     // 自車の矢印は地図回転を打ち消して常に画面の上(進行方向)を指す
@@ -694,9 +771,10 @@ function rebuildFacilities(heading) {
       let showLabel = isLeft; // 右側は元からラベル無し
       if (showLabel) {
         const p = map.latLngToContainerPoint([f.lat, f.lng]);
+        const gap = TUNE.labelGap; // 実車調整で可変
         const tooClose = placedLabels.some(q => {
           const dx = p.x - q.x, dy = p.y - q.y;
-          return dx * dx + dy * dy < LABEL_MIN_GAP_PX * LABEL_MIN_GAP_PX;
+          return dx * dx + dy * dy < gap * gap;
         });
         if (tooClose) showLabel = false;        // 重なる→ラベル省略（ドットは残す）
         else placedLabels.push({ x: p.x, y: p.y });
@@ -893,13 +971,28 @@ function startGeo() {
   );
 }
 
+// コンパスの生値を角度対応の指数移動平均(EMA)で平滑化する。
+// スマホの磁気センサーは震え・飛びが多いので、新値を一定割合だけ取り込む。
+// 359°↔0°をまたいでも最短経路で平均するため、現在値からの差分(±180)で寄せる。
+// TUNE.compass(0..0.9)が大きいほど強く均す＝震えは減るが追従が遅れる。
+function smoothCompass(raw) {
+  compassRaw = raw;
+  if (compassHeading === null) { compassHeading = raw; return raw; }
+  const diff = ((raw - compassHeading + 540) % 360) - 180; // 最短差分
+  const alpha = 1 - TUNE.compass;       // 取り込み率（compass=0で生値そのまま）
+  let next = compassHeading + diff * alpha;
+  next = ((next % 360) + 360) % 360;     // 0..360に正規化
+  compassHeading = next;
+  return next;
+}
+
 function startCompass() {
   function handler(e) {
     // iOS: webkitCompassHeading(真北基準), その他: alpha
     let hdg = null;
     if (typeof e.webkitCompassHeading === 'number') hdg = e.webkitCompassHeading;
     else if (e.alpha !== null) hdg = (360 - e.alpha) % 360; // 近似
-    if (hdg !== null) { compassHeading = hdg; render(); }
+    if (hdg !== null) { smoothCompass(hdg); render(); }
   }
   // iOS 13+ は許可が要る
   if (typeof DeviceOrientationEvent !== 'undefined' &&
@@ -913,13 +1006,56 @@ function startCompass() {
   }
 }
 
+// ---------- 実車調整UIの配線 ----------
+// 各スライダー: 値表示を更新→TUNEに反映→保存→必要なら即再描画。
+function setupTuneUI() {
+  // スライダー定義: [キー, sliderId, valueId, 表示整形, 反映時の追加処理]
+  const rows = [
+    ['rotEase',  'sRotEase',  'vRotEase',  v => v.toFixed(2),       null],
+    ['carTop',   'sCarTop',   'vCarTop',   v => v + '%',            applyCarTop],
+    ['compass',  'sCompass',  'vCompass',  v => v.toFixed(2),       null],
+    ['labelGap', 'sLabelGap', 'vLabelGap', v => Math.round(v)+'px', () => { facDirty = true; render(); }],
+  ];
+  function syncRow(r) {
+    const [key, sId, vId, fmt] = r;
+    const s = document.getElementById(sId), label = document.getElementById(vId);
+    s.value = TUNE[key];
+    label.textContent = fmt(TUNE[key]);
+  }
+  rows.forEach(r => {
+    const [key, sId, vId, fmt, after] = r;
+    const s = document.getElementById(sId);
+    syncRow(r);
+    s.addEventListener('input', () => {
+      TUNE[key] = Number(s.value);
+      document.getElementById(vId).textContent = fmt(TUNE[key]);
+      saveTune();
+      if (after) after();
+    });
+  });
+  // パネル開閉
+  document.getElementById('tuneBtn').addEventListener('click', () => {
+    document.getElementById('tunePanel').classList.toggle('open');
+  });
+  // 既定値に戻す
+  document.getElementById('tuneReset').addEventListener('click', () => {
+    TUNE = Object.assign({}, TUNE_DEFAULTS);
+    saveTune();
+    rows.forEach(syncRow);
+    applyCarTop();
+    facDirty = true; render();
+  });
+}
+
 // ---------- デバッグ用にグローバル公開 ----------
 // 注: Object.assign だと getter が即時評価され値が固定されるため、defineProperties で本物のgetterにする
 Object.assign(window, {
   bearing, distance, relativeSide, relativeAngle, angularDiff, currentHeading, fetchFacilities, render, doRender,
   shortName, spokenDistance, announceNearby, brandColor, openState,
   distToRoad, distToPts, findCurrentRoad, pointSegDist, toXY, parseOverpass,
-  roadSideThresh, onRoadMax,
+  roadSideThresh, onRoadMax, smoothCompass, applyCarTop, saveTune,
+  _setCompass(v) { compassHeading = v; },
+  _setTune(k, v) { TUNE[k] = v; },
   _setFacDirty() { facDirty = true; },
   _setOnlyRoad(on) { onlyCurrentRoad = on; facDirty = true; },
   _injectRoads(r) { roads = r; },
@@ -928,11 +1064,13 @@ Object.assign(window, {
 });
 Object.defineProperties(window, {
   _map: { get() { return map; }, configurable: true },
-  _state: { get() { return { myPos, gpsHeading, compassHeading, speed, facilities, roads, currentRoad, onlyCurrentRoad, currentRotation, facBuildCount }; }, configurable: true }
+  _state: { get() { return { myPos, gpsHeading, compassHeading, compassRaw, speed, facilities, roads, currentRoad, onlyCurrentRoad, currentRotation, facBuildCount, TUNE }; }, configurable: true }
 });
 
 // ---------- 起動 ----------
 initMap();
+applyCarTop();   // 保存済みの自車下寄せ量を反映
+setupTuneUI();   // 実車調整スライダーを配線
 requestAnimationFrame(rotationTick); // 地図回転の滑らかな補間ループを常時稼働
 document.getElementById('startBtn').addEventListener('click', () => {
   document.getElementById('startBtn').style.display = 'none';
