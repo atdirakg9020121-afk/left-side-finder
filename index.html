@@ -52,6 +52,19 @@
   .dot.left { background: #2ecc71; }
   .dot.right { background: #888; }
 
+  /* 施設マーカー：色付きの点＋（左側のみ）名前ラベル。回転は親で打ち消す。 */
+  .fac-icon { width: 0; height: 0; }
+  .fac { position: absolute; display: flex; align-items: center; gap: 3px;
+         transform-origin: 0 0; white-space: nowrap; }
+  .fac-dot { display: inline-block; flex: 0 0 auto; width: 14px; height: 14px;
+             border-radius: 50%; border: 2px solid #fff; margin: -8px 0 0 -8px;
+             box-shadow: 0 0 2px rgba(0,0,0,0.5); }
+  .fac.R .fac-dot { width: 10px; height: 10px; margin: -6px 0 0 -6px; opacity: 0.5; }
+  .fac-label { font-size: 12px; font-weight: 700; color: #14532d;
+               background: rgba(255,255,255,0.9); border-radius: 4px;
+               padding: 1px 5px; margin-top: -10px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+  .fac-label small { font-weight: 400; color: #2a7; margin-left: 4px; font-size: 10px; }
+
   /* 自分マーカー：中心の青丸＋進行方向を指す三角 */
   .me-icon { position: relative; }
   .me-dot {
@@ -232,6 +245,8 @@ function render() {
   let leftCount = 0;
 
   if (h.value !== null) {
+    // 地図回転を打ち消してラベルを常に水平に保つための逆回転角
+    const labelRot = -currentRotation;
     facilities.forEach(f => {
       const b = bearing(myPos.lat, myPos.lng, f.lat, f.lng);
       const side = relativeSide(h.value, b);
@@ -239,18 +254,44 @@ function render() {
       if (side === 'left') leftCount++;
       if (side === 'right' && !showRight) return;
 
-      const color = side === 'left' ? '#2ecc71' : '#888';
-      const opacity = side === 'left' ? 1 : 0.4;
-      const m = L.circleMarker([f.lat, f.lng], {
-        radius: side === 'left' ? 9 : 6,
-        color: '#fff', weight: 1.5, fillColor: color, fillOpacity: opacity
-      }).addTo(map);
+      const isLeft = side === 'left';
+      const color = isLeft ? '#2ecc71' : '#888';
       const typeLabel = f.type === 'fuel' ? '⛽' : '🏪';
-      m.bindPopup(`${typeLabel} ${f.name}<br>${side === 'left' ? '左' : '右'}側 / ${Math.round(dist)}m`);
+      // 左側だけ名前ラベルを出す。右側(薄表示)は点だけでごちゃつきを防ぐ。
+      const labelHtml = isLeft
+        ? `<span class="fac-label">${typeLabel}${shortName(f)}<small>${Math.round(dist)}m</small></span>`
+        : '';
+      const icon = L.divIcon({
+        className: 'fac-icon',
+        html: `<div class="fac ${isLeft ? 'L' : 'R'}" style="transform: rotate(${labelRot}deg);">`
+            + `<span class="fac-dot" style="background:${color};"></span>${labelHtml}</div>`,
+        iconSize: [0, 0], iconAnchor: [0, 0]
+      });
+      const m = L.marker([f.lat, f.lng], { icon, interactive: true, zIndexOffset: isLeft ? 500 : 0 }).addTo(map);
+      m.bindPopup(`${typeLabel} ${f.name}<br>${isLeft ? '左' : '右'}側 / ${Math.round(dist)}m`);
       facilityMarkers.push(m);
     });
   }
   document.getElementById('leftcount').textContent = leftCount + ' 件';
+}
+
+// コンビニ/GSのチェーン名を運転中に読みやすい短縮形にする
+function shortName(f) {
+  let n = f.name || '';
+  const rules = [
+    [/セブン[-‐ー]?イレブン/, 'セブン'],
+    [/ファミリーマート/, 'ファミマ'],
+    [/ローソンストア\s*100|ローソン100/, 'ローソン100'],
+    [/ナチュラルローソン/, 'ナチュラルローソン'],
+    [/ローソン/, 'ローソン'],
+    [/ミニストップ/, 'ミニストップ'],
+    [/デイリーヤマザキ/, 'デイリー'],
+    [/セイコーマート/, 'セイコマ'],
+  ];
+  for (const [re, s] of rules) if (re.test(n)) return s;
+  // ガソスタや無名はそのまま(長ければ省略)
+  if (!n) return f.type === 'fuel' ? 'GS' : '店';
+  return n.length > 8 ? n.slice(0, 8) + '…' : n;
 }
 
 function setMsg(t) { document.getElementById('msg').textContent = t; }
