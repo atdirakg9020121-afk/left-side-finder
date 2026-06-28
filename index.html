@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>左側ファインダー</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; font-family: -apple-system, "Hiragino Kaku Gothic ProN", sans-serif; }
+  #map { position: absolute; top: 0; bottom: 0; left: 0; right: 0; z-index: 1; }
+
+  #status {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 1000;
+    background: rgba(20,20,30,0.85); color: #fff; padding: 10px 14px;
+    font-size: 13px; line-height: 1.5; backdrop-filter: blur(4px);
+  }
+  #status .row { display: flex; justify-content: space-between; }
+  #status b { color: #6cf; }
+  #status .warn { color: #fc6; }
+
+  #startBtn {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    z-index: 2000; padding: 18px 32px; font-size: 18px; font-weight: bold;
+    background: #2a7; color: #fff; border: none; border-radius: 14px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.3); cursor: pointer;
+  }
+
+  #controls {
+    position: absolute; bottom: 0; left: 0; right: 0; z-index: 1000;
+    background: rgba(20,20,30,0.85); color: #fff; padding: 10px 14px;
+    display: flex; align-items: center; gap: 12px; font-size: 13px;
+    backdrop-filter: blur(4px);
+  }
+  #controls label { display: flex; align-items: center; gap: 6px; }
+  #controls .legend { margin-left: auto; display: flex; gap: 10px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; }
+  .dot.left { background: #2ecc71; }
+  .dot.right { background: #888; }
+
+  .arrow-icon div {
+    width: 0; height: 0; border-left: 9px solid transparent; border-right: 9px solid transparent;
+    border-bottom: 22px solid #2196f3; filter: drop-shadow(0 0 2px #000);
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="status">
+  <div class="row"><span>進行方向 (heading)</span><b id="heading">--</b></div>
+  <div class="row"><span>方向ソース</span><b id="hsource">--</b></div>
+  <div class="row"><span>速度</span><b id="speed">--</b></div>
+  <div class="row"><span>左側の施設</span><b id="leftcount">--</b></div>
+  <div class="row"><span id="msg" class="warn"></span></div>
+</div>
+
+<button id="startBtn">スタート（位置情報を許可）</button>
+
+<div id="controls">
+  <label><input type="checkbox" id="showRight" checked> 右側も薄く表示</label>
+  <div class="legend">
+    <span><span class="dot left"></span>左</span>
+    <span><span class="dot right"></span>右</span>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ---------- 状態 ----------
+let map, meMarker, headingMarker;
+let myPos = null;          // {lat, lng}
+let gpsHeading = null;     // GPS由来の進行方位(度)
+let compassHeading = null; // コンパス由来の方位(度)
+let speed = null;          // m/s
+let lastFetchPos = null;   // 最後に施設を取得した位置
+let facilityMarkers = [];
+let facilities = [];       // 取得済み施設 [{lat,lng,name,type}]
+
+// ---------- ユーティリティ ----------
+const toRad = d => d * Math.PI / 180;
+const toDeg = r => r * 180 / Math.PI;
+
+// 2点間の方位角(度, 北=0, 時計回り)
+function bearing(lat1, lon1, lat2, lon2) {
+  const φ1 = toRad(lat1), φ2 = toRad(lat2);
+  const Δλ = toRad(lon2 - lon1);
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+// 2点間の距離(m) ハバーサイン
+function distance(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const φ1 = toRad(lat1), φ2 = toRad(lat2);
+  const Δφ = toRad(lat2 - lat1), Δλ = toRad(lon2 - lon1);
+  const a = Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// 施設が進行方向の左にあるか。
+// 進行方位 heading に対する、施設方位 facBearing の相対角を -180..180 に。
+// 負(左回り) なら左、正なら右。
+function relativeSide(heading, facBearing) {
+  let diff = ((facBearing - heading + 540) % 360) - 180; // -180..180
+  return diff < 0 ? 'left' : 'right';
+}
+
+// 現在採用する進行方位を決める（走行中はGPS、低速はコンパス）
+function currentHeading() {
+  if (speed !== null && speed > 2.0 && gpsHeading !== null) {
+    return { value: gpsHeading, source: 'GPS(走行)' };
+  }
+  if (compassHeading !== null) {
+    return { value: compassHeading, source: 'コンパス' };
+  }
+  if (gpsHeading !== null) {
+    return { value: gpsHeading, source: 'GPS' };
+  }
+  return { value: null, source: '取得中' };
+}
+
+// ---------- 地図 ----------
+function initMap() {
+  map = L.map('map', { zoomControl: false }).setView([35.681, 139.767], 16);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '© OpenStreetMap'
+  }).addTo(map);
+}
+
+// ---------- 施設取得 (Overpass / OpenStreetMap) ----------
+async function fetchFacilities(lat, lng) {
+  const radius = 800; // m
+  const query = `
+    [out:json][timeout:20];
+    (
+      node["shop"="convenience"](around:${radius},${lat},${lng});
+      node["amenity"="fuel"](around:${radius},${lat},${lng});
+    );
+    out body;`;
+  try {
+    const res = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST', body: query
+    });
+    const data = await res.json();
+    facilities = data.elements.map(e => ({
+      lat: e.lat, lng: e.lon,
+      name: e.tags.name || (e.tags.amenity === 'fuel' ? 'ガソリンスタンド' : 'コンビニ'),
+      type: e.tags.amenity === 'fuel' ? 'fuel' : 'conv'
+    }));
+    lastFetchPos = { lat, lng };
+    setMsg('');
+    render();
+  } catch (err) {
+    setMsg('施設データ取得に失敗（電波/サーバ混雑）。少し待って移動すると再取得します。');
+  }
+}
+
+// ---------- 描画 ----------
+function render() {
+  if (!myPos) return;
+  const h = currentHeading();
+  document.getElementById('heading').textContent = h.value === null ? '--' : Math.round(h.value) + '°';
+  document.getElementById('hsource').textContent = h.source;
+  document.getElementById('speed').textContent = speed === null ? '--' : (speed * 3.6).toFixed(0) + ' km/h';
+
+  // 自分のマーカー
+  if (!meMarker) {
+    meMarker = L.circleMarker([myPos.lat, myPos.lng], {
+      radius: 8, color: '#fff', weight: 2, fillColor: '#2196f3', fillOpacity: 1
+    }).addTo(map);
+  } else {
+    meMarker.setLatLng([myPos.lat, myPos.lng]);
+  }
+
+  // 進行方向の矢印
+  if (h.value !== null) {
+    const icon = L.divIcon({
+      className: 'arrow-icon',
+      html: `<div style="transform: rotate(${h.value}deg); transform-origin: center;"></div>`,
+      iconSize: [18, 22], iconAnchor: [9, 11]
+    });
+    if (!headingMarker) headingMarker = L.marker([myPos.lat, myPos.lng], { icon }).addTo(map);
+    else { headingMarker.setLatLng([myPos.lat, myPos.lng]); headingMarker.setIcon(icon); }
+  }
+
+  // 施設マーカー再描画
+  facilityMarkers.forEach(m => map.removeLayer(m));
+  facilityMarkers = [];
+  const showRight = document.getElementById('showRight').checked;
+  let leftCount = 0;
+
+  if (h.value !== null) {
+    facilities.forEach(f => {
+      const b = bearing(myPos.lat, myPos.lng, f.lat, f.lng);
+      const side = relativeSide(h.value, b);
+      const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
+      if (side === 'left') leftCount++;
+      if (side === 'right' && !showRight) return;
+
+      const color = side === 'left' ? '#2ecc71' : '#888';
+      const opacity = side === 'left' ? 1 : 0.4;
+      const m = L.circleMarker([f.lat, f.lng], {
+        radius: side === 'left' ? 9 : 6,
+        color: '#fff', weight: 1.5, fillColor: color, fillOpacity: opacity
+      }).addTo(map);
+      const typeLabel = f.type === 'fuel' ? '⛽' : '🏪';
+      m.bindPopup(`${typeLabel} ${f.name}<br>${side === 'left' ? '左' : '右'}側 / ${Math.round(dist)}m`);
+      facilityMarkers.push(m);
+    });
+  }
+  document.getElementById('leftcount').textContent = leftCount + ' 件';
+}
+
+function setMsg(t) { document.getElementById('msg').textContent = t; }
+
+// ---------- センサー ----------
+function startGeo() {
+  if (!navigator.geolocation) { setMsg('この端末は位置情報に対応していません'); return; }
+  navigator.geolocation.watchPosition(pos => {
+    myPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+    if (pos.coords.heading !== null && !isNaN(pos.coords.heading)) gpsHeading = pos.coords.heading;
+    if (pos.coords.speed !== null && !isNaN(pos.coords.speed)) speed = pos.coords.speed;
+
+    if (!meMarker) map.setView([myPos.lat, myPos.lng], 16);
+
+    // 一定距離移動したら施設を再取得
+    if (!lastFetchPos || distance(myPos.lat, myPos.lng, lastFetchPos.lat, lastFetchPos.lng) > 300) {
+      fetchFacilities(myPos.lat, myPos.lng);
+    }
+    render();
+  }, err => {
+    setMsg('位置情報の取得に失敗: ' + err.message);
+  }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
+}
+
+function startCompass() {
+  function handler(e) {
+    // iOS: webkitCompassHeading(真北基準), その他: alpha
+    let hdg = null;
+    if (typeof e.webkitCompassHeading === 'number') hdg = e.webkitCompassHeading;
+    else if (e.alpha !== null) hdg = (360 - e.alpha) % 360; // 近似
+    if (hdg !== null) { compassHeading = hdg; render(); }
+  }
+  // iOS 13+ は許可が要る
+  if (typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function') {
+    DeviceOrientationEvent.requestPermission().then(state => {
+      if (state === 'granted') window.addEventListener('deviceorientation', handler, true);
+    }).catch(() => {});
+  } else {
+    window.addEventListener('deviceorientationabsolute', handler, true);
+    window.addEventListener('deviceorientation', handler, true);
+  }
+}
+
+// ---------- デバッグ用にグローバル公開 ----------
+Object.assign(window, {
+  bearing, distance, relativeSide, currentHeading, fetchFacilities, render,
+  get _state() { return { myPos, gpsHeading, compassHeading, speed, facilities }; },
+  _inject(p) { if (p.myPos) myPos = p.myPos; if ('gpsHeading' in p) gpsHeading = p.gpsHeading; if ('speed' in p) speed = p.speed; if ('compassHeading' in p) compassHeading = p.compassHeading; }
+});
+
+// ---------- 起動 ----------
+initMap();
+document.getElementById('startBtn').addEventListener('click', () => {
+  document.getElementById('startBtn').style.display = 'none';
+  startGeo();
+  startCompass();
+});
+document.getElementById('showRight').addEventListener('change', render);
+</script>
+</body>
+</html>
