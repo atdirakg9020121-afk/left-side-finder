@@ -51,7 +51,11 @@
     backdrop-filter: blur(4px);
   }
   #controls label { display: flex; align-items: center; gap: 6px; }
-  #controls .legend { margin-left: auto; display: flex; gap: 10px; }
+  #controls .legend { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+  .legend span[data-brand] { cursor: pointer; user-select: none; padding: 2px 7px;
+    border-radius: 12px; background: rgba(255,255,255,0.10); transition: opacity .12s; }
+  .legend span[data-brand].off { opacity: 0.32; text-decoration: line-through; }
+  .legend span[data-brand]:active { background: rgba(255,255,255,0.25); }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; }
   .dot.left { background: #2ecc71; }
   .dot.right { background: #888; }
@@ -115,11 +119,12 @@
       <option value="5000">5km</option>
     </select>
   </label>
-  <div class="legend">
-    <span><span class="dot" style="background:#ee7b00"></span>セブン</span>
-    <span><span class="dot" style="background:#0068b7"></span>ローソン</span>
-    <span><span class="dot" style="background:#00a040"></span>ファミマ</span>
-    <span><span class="dot" style="background:#e03131"></span>GS</span>
+  <div class="legend" id="legend" title="タップで表示/非表示を切替">
+    <span data-brand="seven"><span class="dot" style="background:#ee7b00"></span>セブン</span>
+    <span data-brand="lawson"><span class="dot" style="background:#0068b7"></span>ローソン</span>
+    <span data-brand="famima"><span class="dot" style="background:#00a040"></span>ファミマ</span>
+    <span data-brand="gs"><span class="dot" style="background:#e03131"></span>GS</span>
+    <span data-brand="other"><span class="dot" style="background:#7a5ad6"></span>その他</span>
   </div>
 </div>
 
@@ -131,6 +136,8 @@ let currentRotation = 0;   // 現在描画している地図回転角(度)
 let targetRotation = 0;    // 目標の地図回転角(度)。方位入力で更新、補間で近づける
 let headingKnown = false;  // 進行方位が分かっているか(分からない間は北上)
 let voiceOn = false;       // 音声案内ON/OFF
+// 凡例フィルタ：表示中のブランド集合。空でない＝そのキーだけ表示
+const activeBrands = new Set(['seven', 'lawson', 'famima', 'gs', 'other']);
 let voicePrimed = false;   // iOS等で音声が解禁済みか
 const announced = {};      // 施設キー -> 通知済みフラグ（再接近でリセット）
 let lastSpeakAt = 0;       // 最後に発話した時刻(ms)
@@ -245,6 +252,8 @@ function announceNearby(heading) {
     const key = facKey(f);
     // 離れたら通知済みフラグを解除（再接近で再通知できるように）
     if (dist > VOICE_RESET) { announced[key] = false; continue; }
+
+    if (!activeBrands.has(brandKey(f))) continue; // 凡例で非表示のブランドは読み上げない
 
     const ang = relativeAngle(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
     const isLeft = ang < 0;
@@ -420,6 +429,7 @@ function rebuildFacilities(heading) {
     facilities.forEach(f => {
       const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
       if (dist > maxDist) return; // 距離フィルタ外は出さない
+      if (!activeBrands.has(brandKey(f))) return; // 凡例で非表示にしたブランドは出さない
 
       const ang = relativeAngle(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
       const isLeft = ang < 0;
@@ -482,6 +492,16 @@ function shortName(f) {
 }
 
 // ブランド別の色を返す（色＝チェーン。左右は大きさ/濃さ/ラベルで区別）
+// 凡例フィルタ用のブランド分類（legendのdata-brandと対応）
+function brandKey(f) {
+  const n = f.name || '';
+  if (f.type === 'fuel') return 'gs';
+  if (/セブン([-‐ー]?イレブン)?/.test(n)) return 'seven';
+  if (/ローソン/.test(n))                 return 'lawson';
+  if (/ファミリーマート|ファミマ/.test(n)) return 'famima';
+  return 'other'; // ミニストップ・デイリー・セイコマ・その他コンビニ
+}
+
 function brandColor(f) {
   const n = f.name || '';
   if (f.type === 'fuel') return '#e03131';                       // ガソスタ=赤
@@ -654,6 +674,17 @@ document.getElementById('startBtn').addEventListener('click', () => {
 });
 document.getElementById('showRight').addEventListener('change', () => { facDirty = true; render(); });
 document.getElementById('radius').addEventListener('change', () => { facDirty = true; render(); });
+// 凡例タップでブランド表示のON/OFFを切替（重い都心部などで表示対象を絞る）
+document.getElementById('legend').addEventListener('click', e => {
+  const span = e.target.closest('span[data-brand]');
+  if (!span) return;
+  const key = span.dataset.brand;
+  if (activeBrands.has(key)) activeBrands.delete(key);
+  else activeBrands.add(key);
+  span.classList.toggle('off', !activeBrands.has(key));
+  facDirty = true;
+  render();
+});
 document.getElementById('voiceOn').addEventListener('change', e => {
   voiceOn = e.target.checked;
   if (voiceOn) { primeVoice(); speak('音声案内をオンにしました'); }
