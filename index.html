@@ -95,6 +95,7 @@
 <button id="startBtn">スタート（位置情報を許可）</button>
 
 <div id="controls">
+  <label><input type="checkbox" id="voiceOn"> 🔊 音声案内</label>
   <label><input type="checkbox" id="showRight" checked> 右側も薄く表示</label>
   <div class="legend">
     <span><span class="dot left"></span>左</span>
@@ -107,6 +108,15 @@
 // ---------- 状態 ----------
 let map, meMarker;
 let currentRotation = 0;   // 現在の地図回転角(度)
+let voiceOn = false;       // 音声案内ON/OFF
+let voicePrimed = false;   // iOS等で音声が解禁済みか
+const announced = {};      // 施設キー -> 通知済みフラグ（再接近でリセット）
+let lastSpeakAt = 0;       // 最後に発話した時刻(ms)
+// 音声案内のしきい値
+const VOICE_NEAR = 250;    // この距離(m)以内で通知
+const VOICE_RESET = 400;   // この距離(m)より離れたら再通知可に戻す
+const VOICE_COOLDOWN = 3500; // 連続発話の最小間隔(ms)
+const VOICE_FWD_DEG = 100; // 進行方向からこの角度以内を「前方」とみなす
 let myPos = null;          // {lat, lng}
 let gpsHeading = null;     // GPS由来の進行方位(度)
 let compassHeading = null; // コンパス由来の方位(度)
@@ -137,12 +147,15 @@ function distance(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 
+// 進行方位 heading に対する、施設方位 facBearing の相対角を -180..180 で返す。
+// 負(左回り)＝左手、正＝右手。0付近＝正面、±180付近＝真後ろ。
+function relativeAngle(heading, facBearing) {
+  return ((facBearing - heading + 540) % 360) - 180; // -180..180
+}
+
 // 施設が進行方向の左にあるか。
-// 進行方位 heading に対する、施設方位 facBearing の相対角を -180..180 に。
-// 負(左回り) なら左、正なら右。
 function relativeSide(heading, facBearing) {
-  let diff = ((facBearing - heading + 540) % 360) - 180; // -180..180
-  return diff < 0 ? 'left' : 'right';
+  return relativeAngle(heading, facBearing) < 0 ? 'left' : 'right';
 }
 
 // 現在採用する進行方位を決める（走行中はGPS、低速はコンパス）
@@ -157,6 +170,65 @@ function currentHeading() {
     return { value: gpsHeading, source: 'GPS' };
   }
   return { value: null, source: '取得中' };
+}
+
+// ---------- 音声案内 ----------
+// 距離を聞き取りやすい丸めた言い方にする（50m単位、100以上は端数を丸める）
+function spokenDistance(m) {
+  if (m < 50) return Math.round(m / 10) * 10 + 'メートル';
+  if (m < 1000) return Math.round(m / 50) * 50 + 'メートル';
+  return (m / 1000).toFixed(1) + 'キロ';
+}
+
+function facKey(f) { return f.lat.toFixed(5) + ',' + f.lng.toFixed(5); }
+
+function speak(text) {
+  if (!('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'ja-JP';
+  u.rate = 1.05;
+  window.speechSynthesis.speak(u);
+}
+
+// 音声を解禁（iOS等はユーザー操作内で一度発話しないと以後しゃべらない）
+function primeVoice() {
+  if (voicePrimed || !('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(' ');
+  u.volume = 0; u.lang = 'ja-JP';
+  window.speechSynthesis.speak(u);
+  voicePrimed = true;
+}
+
+// 前方・左・近距離に入った未通知の施設を読み上げる
+function announceNearby(heading) {
+  if (!voiceOn || heading === null || !myPos) return;
+  const now = Date.now();
+
+  // まず候補を集める（左・前方・近い・未通知）
+  let best = null;
+  for (const f of facilities) {
+    const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
+    const key = facKey(f);
+    // 離れたら通知済みフラグを解除（再接近で再通知できるように）
+    if (dist > VOICE_RESET) { announced[key] = false; continue; }
+
+    const ang = relativeAngle(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
+    const isLeft = ang < 0;
+    const isForward = Math.abs(ang) <= VOICE_FWD_DEG;
+    if (!isLeft || !isForward) continue;
+    if (dist > VOICE_NEAR) continue;
+    if (announced[key]) continue;
+
+    // 最も近いものを1つだけ選ぶ
+    if (!best || dist < best.dist) best = { f, dist, key };
+  }
+
+  if (!best) return;
+  if (now - lastSpeakAt < VOICE_COOLDOWN) return; // 連続発話を抑制
+
+  speak('左、' + spokenDistance(best.dist) + '、' + shortName(best.f));
+  announced[best.key] = true;
+  lastSpeakAt = now;
 }
 
 // ---------- 地図 ----------
@@ -273,6 +345,9 @@ function render() {
     });
   }
   document.getElementById('leftcount').textContent = leftCount + ' 件';
+
+  // 前方・左・近距離の施設を音声案内
+  announceNearby(h.value);
 }
 
 // コンビニ/GSのチェーン名を運転中に読みやすい短縮形にする
@@ -376,8 +451,10 @@ function startCompass() {
 // ---------- デバッグ用にグローバル公開 ----------
 // 注: Object.assign だと getter が即時評価され値が固定されるため、defineProperties で本物のgetterにする
 Object.assign(window, {
-  bearing, distance, relativeSide, currentHeading, fetchFacilities, render,
-  _inject(p) { if (p.myPos) myPos = p.myPos; if ('gpsHeading' in p) gpsHeading = p.gpsHeading; if ('speed' in p) speed = p.speed; if ('compassHeading' in p) compassHeading = p.compassHeading; }
+  bearing, distance, relativeSide, relativeAngle, currentHeading, fetchFacilities, render,
+  shortName, spokenDistance, announceNearby,
+  _setVoice(on) { voiceOn = on; },
+  _inject(p) { if (p.myPos) myPos = p.myPos; if ('gpsHeading' in p) gpsHeading = p.gpsHeading; if ('speed' in p) speed = p.speed; if ('compassHeading' in p) compassHeading = p.compassHeading; if (p.facilities) facilities = p.facilities; }
 });
 Object.defineProperties(window, {
   _map: { get() { return map; }, configurable: true },
@@ -388,10 +465,16 @@ Object.defineProperties(window, {
 initMap();
 document.getElementById('startBtn').addEventListener('click', () => {
   document.getElementById('startBtn').style.display = 'none';
+  primeVoice(); // ユーザー操作のうちに音声を解禁(iOS対策)
   startGeo();
   startCompass();
 });
 document.getElementById('showRight').addEventListener('change', render);
+document.getElementById('voiceOn').addEventListener('change', e => {
+  voiceOn = e.target.checked;
+  if (voiceOn) { primeVoice(); speak('音声案内をオンにしました'); }
+  else window.speechSynthesis && window.speechSynthesis.cancel();
+});
 </script>
 </body>
 </html>
