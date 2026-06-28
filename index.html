@@ -204,6 +204,10 @@ let facHeadingAt = null;   // 最後にピンを組んだ時の進行方位
 let facPosAt = null;       // 最後にピンを組んだ時の自車位置
 const FAC_HEADING_THRESH = 3;  // 向きがこれ以上(度)変わったらピン再生成
 const FAC_MOVE_THRESH = 25;    // これ以上(m)動いたらピン再生成
+// ラベル間引き：既に置いたラベルとの画面距離(px)がこれ未満なら、後から来た(=より遠い)
+// 施設のラベルを省いてドットだけにする。都心でラベルが重なって読めない問題への対応。
+// 近い施設ほど優先してラベルを残す（運転中は手前の店の方が重要なため）。
+const LABEL_MIN_GAP_PX = 46;
 
 // ---------- ユーティリティ ----------
 const toRad = d => d * Math.PI / 180;
@@ -514,11 +518,44 @@ async function fetchFacilities(lat, lng) {
     parseOverpass(data);
     lastFetchPos = { lat, lng };
     facDirty = true; // 新しい施設データなのでピンを必ず作り直す
+    saveCache(lat, lng);   // オフライン耐性：成功データを保存（トンネル・圏外で消えないように）
     setMsg('');
     render();
   } catch (err) {
-    setMsg('施設データ取得に失敗（電波/サーバ混雑）。少し待って移動すると再取得します。');
+    // トンネル・圏外・サーバ混雑など。取得済みの施設(facilities)はそのまま残すので
+    // 走行中に一瞬電波が切れてもピンは消えない。初回失敗やリロード直後で施設が空の
+    // ときだけ、前回成功時のキャッシュを復元して「真っ白」を防ぐ。
+    if (!facilities.length && loadCache()) {
+      facDirty = true;
+      setMsg('オフライン表示中（前回取得した施設を表示）。電波が戻ると自動更新します。');
+      render();
+    } else {
+      setMsg('施設データ取得に失敗（電波/サーバ混雑）。少し待って移動すると再取得します。');
+    }
   }
+}
+
+// ---------- オフライン耐性：施設・道路を localStorage にキャッシュ ----------
+const CACHE_KEY = 'lsf_cache_v1';
+function saveCache(lat, lng) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({
+      lat, lng, t: Date.now(), facilities, roads
+    }));
+  } catch (e) { /* 容量超過・プライベートモード等は無視（キャッシュは無くても動く） */ }
+}
+// 戻り値: 復元できたら true。facilities/roads/lastFetchPos を埋める。
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return false;
+    const c = JSON.parse(raw);
+    if (!c || !Array.isArray(c.facilities) || !c.facilities.length) return false;
+    facilities = c.facilities;
+    roads = Array.isArray(c.roads) ? c.roads : [];
+    lastFetchPos = { lat: c.lat, lng: c.lng };
+    return true;
+  } catch (e) { return false; }
 }
 
 // Overpassの応答(node/way混在)を施設配列と道路配列に分解する。
@@ -620,6 +657,10 @@ function rebuildFacilities(heading) {
 
   if (heading !== null) {
     const labelRot = -currentRotation; // ラベルを水平に保つ逆回転
+
+    // ① 描画対象を集める（距離・ブランド・道路・左右フィルタを適用）。
+    //    ここではマーカーをまだ作らず、後でラベル間引きするための候補リストにする。
+    const draw = [];
     facilities.forEach(f => {
       const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
       if (dist > maxDist) return; // 距離フィルタ外は出さない
@@ -641,6 +682,25 @@ function rebuildFacilities(heading) {
         }
       }
       if (!isLeft && !showRight) return;
+      draw.push({ f, dist, isLeft });
+    });
+
+    // ② 近い施設ほど優先してラベルを残すため距離順に並べる。
+    //    ラベルは左側施設だけが持つ。置いたラベルの画面座標を覚えておき、
+    //    近すぎる(重なる)左側施設は後勝ちでラベルを省きドットだけにする(間引き)。
+    draw.sort((a, b) => a.dist - b.dist);
+    const placedLabels = []; // 既に置いたラベルの画面座標 [{x,y}]
+    draw.forEach(({ f, dist, isLeft }) => {
+      let showLabel = isLeft; // 右側は元からラベル無し
+      if (showLabel) {
+        const p = map.latLngToContainerPoint([f.lat, f.lng]);
+        const tooClose = placedLabels.some(q => {
+          const dx = p.x - q.x, dy = p.y - q.y;
+          return dx * dx + dy * dy < LABEL_MIN_GAP_PX * LABEL_MIN_GAP_PX;
+        });
+        if (tooClose) showLabel = false;        // 重なる→ラベル省略（ドットは残す）
+        else placedLabels.push({ x: p.x, y: p.y });
+      }
 
       const color = brandColor(f);          // 色＝チェーン
       const typeLabel = f.type === 'fuel' ? '⛽' : '🏪';
@@ -648,7 +708,7 @@ function rebuildFacilities(heading) {
       const badge = os.state === '24h'   ? `<i class="badge b24">24h</i>`
                   : os.state === 'open'  ? `<i class="badge bopen">営</i>`
                   : os.state === 'closed'? `<i class="badge bclosed">×</i>` : '';
-      const labelHtml = isLeft
+      const labelHtml = showLabel
         ? `<span class="fac-label">${typeLabel}${shortName(f)}${badge}<small>${Math.round(dist)}m</small></span>`
         : '';
       const icon = L.divIcon({
@@ -804,6 +864,10 @@ function applyPosition(pos) {
 
 function startGeo() {
   if (!navigator.geolocation) { setMsg('この端末は位置情報に対応していません'); return; }
+
+  // オフライン耐性：起動直後に前回キャッシュを先読み。圏外・トンネルで
+  // アプリを開いても真っ白にならず、位置が取れ次第ピンが描かれる。
+  loadCache();
 
   setMsg('位置情報を取得中…（屋内だと時間がかかります）');
 
