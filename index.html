@@ -17,9 +17,11 @@
        自車を画面の下寄り(66%)に置き、進行方向(前方)を広く見せる＝カーナビ式。
        回転軸も自車になる(中心=自車位置)。 */
     width: 150vmax; height: 150vmax;
-    top: 66%; left: 50%;
+    top: 85%; left: 50%;
     transform-origin: center center;
-    transition: transform 0.3s ease-out;
+    /* 回転はJS側で毎フレーム補間する(rotationTick)。CSS transitionは
+       入力(コンパス)が来るたびリスタートしてカクつくので使わない。
+       自車位置を画面の下(78%)へ寄せ、前方を広く＝矢印は手前。 */
   }
   #map { width: 100%; height: 100%; }
 
@@ -95,7 +97,7 @@
   <div class="row"><span>進行方向 (heading)</span><b id="heading">--</b></div>
   <div class="row"><span>方向ソース</span><b id="hsource">--</b></div>
   <div class="row"><span>速度</span><b id="speed">--</b></div>
-  <div class="row"><span>左側の施設</span><b id="leftcount">--</b></div>
+  <div class="row"><span>次の左側施設</span><b id="leftcount">--</b></div>
   <div class="row"><span id="msg" class="warn"></span></div>
 </div>
 
@@ -125,7 +127,9 @@
 <script>
 // ---------- 状態 ----------
 let map, meMarker;
-let currentRotation = 0;   // 現在の地図回転角(度)
+let currentRotation = 0;   // 現在描画している地図回転角(度)
+let targetRotation = 0;    // 目標の地図回転角(度)。方位入力で更新、補間で近づける
+let headingKnown = false;  // 進行方位が分かっているか(分からない間は北上)
 let voiceOn = false;       // 音声案内ON/OFF
 let voicePrimed = false;   // iOS等で音声が解禁済みか
 const announced = {};      // 施設キー -> 通知済みフラグ（再接近でリセット）
@@ -279,20 +283,43 @@ function initMap() {
     .addAttribution('© OpenStreetMap').addTo(map);
 }
 
-// 地図を進行方向が上になるよう回転する（ヘディングアップ）。
+// 進行方向(heading)から地図の目標回転角を決める。実際に回すのは rotationTick。
 // #mapwrap を -heading 回転 = 北をheadingだけ反時計に振る = 進行方向が画面上。
-function applyMapRotation(heading) {
+function setTargetRotation(heading) {
+  if (heading === null) { headingKnown = false; return; }
+  headingKnown = true;
+  // 角度の急なジャンプ(359→0)で逆回転しないよう、現在の連続角に近い表現へ補正
+  const target = -heading;
+  const diff = ((target - targetRotation + 540) % 360) - 180;
+  targetRotation = targetRotation + diff;
+}
+
+// 毎フレーム、現在角を目標角へ少しずつ寄せて地図を滑らかに回す。
+// コンパスが飛び飛びに発火しても、描画はフレーム単位で連続するためカクつかない。
+const ROT_EASE = 0.18;     // 0..1。大きいほど機敏、小さいほど滑らか
+function rotationTick() {
   const wrap = document.getElementById('mapwrap');
-  if (heading === null) {
-    // 方向不明なら回転なし（北上）。中央配置だけ維持。
-    wrap.style.transform = 'translate(-50%, -50%) rotate(0deg)';
-    return;
+  if (wrap) {
+    if (!headingKnown) {
+      // 方向不明：北上に戻す（こちらも滑らかに）。中央配置は常に維持。
+      const diff = 0 - currentRotation;
+      currentRotation = Math.abs(diff) < 0.05 ? 0 : currentRotation + diff * ROT_EASE;
+    } else {
+      const diff = targetRotation - currentRotation;
+      currentRotation = Math.abs(diff) < 0.05 ? targetRotation : currentRotation + diff * ROT_EASE;
+    }
+    wrap.style.transform = `translate(-50%, -50%) rotate(${currentRotation}deg)`;
+    // 自車の矢印は地図回転を打ち消して常に画面の上(進行方向)を指す
+    if (meMarker) {
+      const el = meMarker.getElement();
+      const arrow = el && el.querySelector('.me-arrow');
+      if (arrow) {
+        arrow.style.display = headingKnown ? '' : 'none';
+        arrow.style.transform = `rotate(${-currentRotation}deg)`;
+      }
+    }
   }
-  // 角度の急なジャンプ(359→0)で逆回転しないよう、近い表現に補正
-  let target = -heading;
-  let diff = ((target - currentRotation + 540) % 360) - 180;
-  currentRotation = currentRotation + diff;
-  wrap.style.transform = `translate(-50%, -50%) rotate(${currentRotation}deg)`;
+  requestAnimationFrame(rotationTick);
 }
 
 // ---------- 施設取得 (Overpass / OpenStreetMap) ----------
@@ -341,10 +368,10 @@ function doRender() {
   document.getElementById('hsource').textContent = h.source;
   document.getElementById('speed').textContent = speed === null ? '--' : (speed * 3.6).toFixed(0) + ' km/h';
 
-  // 【軽い更新】地図回転（毎フレームOK。styleを書くだけ）
-  applyMapRotation(h.value);
-  // 【軽い更新】自車マーカー。初回だけ生成し、以後は位置と矢印の角度だけ直接更新（DOM作り直さない）
-  updateMeMarker(h.value);
+  // 【軽い更新】地図回転は目標角だけ更新。実際の回転はrotationTickが滑らかに行う。
+  setTargetRotation(h.value);
+  // 【軽い更新】自車マーカー。初回だけ生成し、以後は位置だけ更新（矢印の角度はrotationTick）
+  updateMeMarker();
 
   // 【重い更新】施設ピンは「向きが一定以上変化 or 移動 or フィルタ変更」時だけ作り直す
   let need = facDirty || facilityMarkers.length === 0;
@@ -363,8 +390,8 @@ function doRender() {
   announceNearby(h.value);
 }
 
-// 自車マーカー：生成は一度きり、更新は位置と矢印角度のみ（軽量）
-function updateMeMarker(heading) {
+// 自車マーカー：生成は一度きり、更新は位置のみ（矢印の向き・表示はrotationTickが担当）
+function updateMeMarker() {
   if (!meMarker) {
     const icon = L.divIcon({
       className: 'me-icon',
@@ -374,15 +401,6 @@ function updateMeMarker(heading) {
     meMarker = L.marker([myPos.lat, myPos.lng], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
   } else {
     meMarker.setLatLng([myPos.lat, myPos.lng]);
-  }
-  // 矢印は地図回転を打ち消して常に画面の上(進行方向)を指す
-  const el = meMarker.getElement();
-  if (el) {
-    const arrow = el.querySelector('.me-arrow');
-    if (arrow) {
-      arrow.style.display = (heading === null) ? 'none' : '';
-      arrow.style.transform = `rotate(${-currentRotation}deg)`;
-    }
   }
 }
 
@@ -395,6 +413,7 @@ function rebuildFacilities(heading) {
   const showRight = document.getElementById('showRight').checked;
   const maxDist = Number(document.getElementById('radius').value); // 距離フィルタ(m)
   let leftCount = 0;
+  let nearestLeft = null; // 進行方向(前方)で一番近い左側施設 {f, dist}
 
   if (heading !== null) {
     const labelRot = -currentRotation; // ラベルを水平に保つ逆回転
@@ -402,8 +421,15 @@ function rebuildFacilities(heading) {
       const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
       if (dist > maxDist) return; // 距離フィルタ外は出さない
 
-      const isLeft = relativeSide(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng)) === 'left';
-      if (isLeft) leftCount++;
+      const ang = relativeAngle(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
+      const isLeft = ang < 0;
+      if (isLeft) {
+        leftCount++;
+        // 前方(真横より前)の左側で最も近いものを「次の左側施設」とする
+        if (Math.abs(ang) <= 100 && (!nearestLeft || dist < nearestLeft.dist)) {
+          nearestLeft = { f, dist };
+        }
+      }
       if (!isLeft && !showRight) return;
 
       const color = brandColor(f);          // 色＝チェーン
@@ -427,7 +453,13 @@ function rebuildFacilities(heading) {
       facilityMarkers.push(m);
     });
   }
-  document.getElementById('leftcount').textContent = leftCount + ' 件';
+  // 「次の左側施設」＝進行方向で一番近い左側施設の名前と距離を表示
+  const nl = document.getElementById('leftcount');
+  if (nearestLeft) {
+    nl.textContent = shortName(nearestLeft.f) + ' ' + Math.round(nearestLeft.dist) + 'm';
+  } else {
+    nl.textContent = heading === null ? '--' : (leftCount ? '前方になし' : 'なし');
+  }
 }
 
 // コンビニ/GSのチェーン名を運転中に読みやすい短縮形にする
@@ -613,6 +645,7 @@ Object.defineProperties(window, {
 
 // ---------- 起動 ----------
 initMap();
+requestAnimationFrame(rotationTick); // 地図回転の滑らかな補間ループを常時稼働
 document.getElementById('startBtn').addEventListener('click', () => {
   document.getElementById('startBtn').style.display = 'none';
   primeVoice(); // ユーザー操作のうちに音声を解禁(iOS対策)
