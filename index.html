@@ -142,6 +142,13 @@ let speed = null;          // m/s
 let lastFetchPos = null;   // 最後に施設を取得した位置
 let facilityMarkers = [];
 let facilities = [];       // 取得済み施設 [{lat,lng,name,type}]
+// 描画コアレス＆ピン再生成の抑制用
+let renderScheduled = false;
+let facDirty = true;       // 施設ピンの再生成が必要か
+let facHeadingAt = null;   // 最後にピンを組んだ時の進行方位
+let facPosAt = null;       // 最後にピンを組んだ時の自車位置
+const FAC_HEADING_THRESH = 3;  // 向きがこれ以上(度)変わったらピン再生成
+const FAC_MOVE_THRESH = 25;    // これ以上(m)動いたらピン再生成
 
 // ---------- ユーティリティ ----------
 const toRad = d => d * Math.PI / 180;
@@ -174,6 +181,11 @@ function relativeAngle(heading, facBearing) {
 // 施設が進行方向の左にあるか。
 function relativeSide(heading, facBearing) {
   return relativeAngle(heading, facBearing) < 0 ? 'left' : 'right';
+}
+
+// 2つの方位の角度差(0..180)
+function angularDiff(a, b) {
+  return Math.abs(((a - b + 540) % 360) - 180);
 }
 
 // 現在採用する進行方位を決める（走行中はGPS、低速はコンパス）
@@ -251,7 +263,14 @@ function announceNearby(heading) {
 
 // ---------- 地図 ----------
 function initMap() {
-  map = L.map('map', { zoomControl: false, attributionControl: false }).setView([35.681, 139.767], 16);
+  map = L.map('map', {
+    zoomControl: false, attributionControl: false,
+    // ヘディングアップで地図ごと回転するため、手動ドラッグは座標がズレて不自然になる。
+    // GPSで常に自車へ自動追従するので手動パンは無効化する（スワイプ不具合の根本対策）。
+    dragging: false, boxZoom: false, keyboard: false,
+    tap: false, touchZoom: true, doubleClickZoom: true, scrollWheelZoom: true,
+    inertia: false
+  }).setView([35.681, 139.767], 16);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19
   }).addTo(map);
@@ -298,6 +317,7 @@ async function fetchFacilities(lat, lng) {
       hours: e.tags.opening_hours || null
     }));
     lastFetchPos = { lat, lng };
+    facDirty = true; // 新しい施設データなのでピンを必ず作り直す
     setMsg('');
     render();
   } catch (err) {
@@ -306,56 +326,92 @@ async function fetchFacilities(lat, lng) {
 }
 
 // ---------- 描画 ----------
+// 公開API。実際の描画は requestAnimationFrame で1フレームに1回へまとめる（コアレス）。
+// コンパスが秒間多数発火しても、描画は最大60fpsに抑えられ軽くなる。
 function render() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => { renderScheduled = false; doRender(); });
+}
+
+function doRender() {
   if (!myPos) return;
   const h = currentHeading();
   document.getElementById('heading').textContent = h.value === null ? '--' : Math.round(h.value) + '°';
   document.getElementById('hsource').textContent = h.source;
   document.getElementById('speed').textContent = speed === null ? '--' : (speed * 3.6).toFixed(0) + ' km/h';
 
-  // 地図全体を進行方向が上になるよう回転（ヘディングアップ）
+  // 【軽い更新】地図回転（毎フレームOK。styleを書くだけ）
   applyMapRotation(h.value);
+  // 【軽い更新】自車マーカー。初回だけ生成し、以後は位置と矢印の角度だけ直接更新（DOM作り直さない）
+  updateMeMarker(h.value);
 
-  // 自分のマーカー（青い丸＋進行方向の三角）。
-  // L.marker(divIcon) なのでズームしても地図上の一点に固定される。
-  // 地図を currentRotation 回転しているので、三角を -currentRotation 戻すと常に画面の上(進行方向)を指す。
-  const arrowRot = (h.value !== null) ? -currentRotation : 0;
-  const meIcon = L.divIcon({
-    className: 'me-icon',
-    html: `<div class="me-dot"></div>` +
-          (h.value !== null ? `<div class="me-arrow" style="transform: rotate(${arrowRot}deg);"></div>` : ''),
-    iconSize: [40, 40], iconAnchor: [20, 20]
-  });
-  if (!meMarker) meMarker = L.marker([myPos.lat, myPos.lng], { icon: meIcon, interactive: false, zIndexOffset: 1000 }).addTo(map);
-  else { meMarker.setLatLng([myPos.lat, myPos.lng]); meMarker.setIcon(meIcon); }
+  // 【重い更新】施設ピンは「向きが一定以上変化 or 移動 or フィルタ変更」時だけ作り直す
+  let need = facDirty || facilityMarkers.length === 0;
+  if (!need && h.value !== null) {
+    if (facHeadingAt === null || angularDiff(h.value, facHeadingAt) >= FAC_HEADING_THRESH) need = true;
+    if (facPosAt === null || distance(myPos.lat, myPos.lng, facPosAt.lat, facPosAt.lng) >= FAC_MOVE_THRESH) need = true;
+  }
+  if (need) {
+    rebuildFacilities(h.value);
+    facHeadingAt = h.value;
+    facPosAt = { lat: myPos.lat, lng: myPos.lng };
+    facDirty = false;
+  }
 
-  // 施設マーカー再描画
+  // 前方・左・近距離の施設を音声案内（内部でクールダウン制御）
+  announceNearby(h.value);
+}
+
+// 自車マーカー：生成は一度きり、更新は位置と矢印角度のみ（軽量）
+function updateMeMarker(heading) {
+  if (!meMarker) {
+    const icon = L.divIcon({
+      className: 'me-icon',
+      html: `<div class="me-dot"></div><div class="me-arrow"></div>`,
+      iconSize: [40, 40], iconAnchor: [20, 20]
+    });
+    meMarker = L.marker([myPos.lat, myPos.lng], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
+  } else {
+    meMarker.setLatLng([myPos.lat, myPos.lng]);
+  }
+  // 矢印は地図回転を打ち消して常に画面の上(進行方向)を指す
+  const el = meMarker.getElement();
+  if (el) {
+    const arrow = el.querySelector('.me-arrow');
+    if (arrow) {
+      arrow.style.display = (heading === null) ? 'none' : '';
+      arrow.style.transform = `rotate(${-currentRotation}deg)`;
+    }
+  }
+}
+
+// 施設ピンを作り直す（重い処理。呼ぶ回数を絞ること）
+let facBuildCount = 0; // 計測用
+function rebuildFacilities(heading) {
+  facBuildCount++;
   facilityMarkers.forEach(m => map.removeLayer(m));
   facilityMarkers = [];
   const showRight = document.getElementById('showRight').checked;
   const maxDist = Number(document.getElementById('radius').value); // 距離フィルタ(m)
   let leftCount = 0;
 
-  if (h.value !== null) {
-    // 地図回転を打ち消してラベルを常に水平に保つための逆回転角
-    const labelRot = -currentRotation;
+  if (heading !== null) {
+    const labelRot = -currentRotation; // ラベルを水平に保つ逆回転
     facilities.forEach(f => {
       const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
       if (dist > maxDist) return; // 距離フィルタ外は出さない
 
-      const side = relativeSide(h.value, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
-      const isLeft = side === 'left';
+      const isLeft = relativeSide(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng)) === 'left';
       if (isLeft) leftCount++;
       if (!isLeft && !showRight) return;
 
       const color = brandColor(f);          // 色＝チェーン
       const typeLabel = f.type === 'fuel' ? '⛽' : '🏪';
       const os = openState(f);
-      // 営業バッジ（判定できた時だけ）
       const badge = os.state === '24h'   ? `<i class="badge b24">24h</i>`
                   : os.state === 'open'  ? `<i class="badge bopen">営</i>`
                   : os.state === 'closed'? `<i class="badge bclosed">×</i>` : '';
-      // 左側だけ名前ラベルを出す。右側(薄表示)は点だけでごちゃつきを防ぐ。
       const labelHtml = isLeft
         ? `<span class="fac-label">${typeLabel}${shortName(f)}${badge}<small>${Math.round(dist)}m</small></span>`
         : '';
@@ -372,9 +428,6 @@ function render() {
     });
   }
   document.getElementById('leftcount').textContent = leftCount + ' 件';
-
-  // 前方・左・近距離の施設を音声案内
-  announceNearby(h.value);
 }
 
 // コンビニ/GSのチェーン名を運転中に読みやすい短縮形にする
@@ -547,14 +600,15 @@ function startCompass() {
 // ---------- デバッグ用にグローバル公開 ----------
 // 注: Object.assign だと getter が即時評価され値が固定されるため、defineProperties で本物のgetterにする
 Object.assign(window, {
-  bearing, distance, relativeSide, relativeAngle, currentHeading, fetchFacilities, render,
+  bearing, distance, relativeSide, relativeAngle, angularDiff, currentHeading, fetchFacilities, render, doRender,
   shortName, spokenDistance, announceNearby, brandColor, openState,
+  _setFacDirty() { facDirty = true; },
   _setVoice(on) { voiceOn = on; },
   _inject(p) { if (p.myPos) myPos = p.myPos; if ('gpsHeading' in p) gpsHeading = p.gpsHeading; if ('speed' in p) speed = p.speed; if ('compassHeading' in p) compassHeading = p.compassHeading; if (p.facilities) facilities = p.facilities; }
 });
 Object.defineProperties(window, {
   _map: { get() { return map; }, configurable: true },
-  _state: { get() { return { myPos, gpsHeading, compassHeading, speed, facilities, currentRotation }; }, configurable: true }
+  _state: { get() { return { myPos, gpsHeading, compassHeading, speed, facilities, currentRotation, facBuildCount }; }, configurable: true }
 });
 
 // ---------- 起動 ----------
@@ -565,8 +619,8 @@ document.getElementById('startBtn').addEventListener('click', () => {
   startGeo();
   startCompass();
 });
-document.getElementById('showRight').addEventListener('change', render);
-document.getElementById('radius').addEventListener('change', render);
+document.getElementById('showRight').addEventListener('change', () => { facDirty = true; render(); });
+document.getElementById('radius').addEventListener('change', () => { facDirty = true; render(); });
 document.getElementById('voiceOn').addEventListener('change', e => {
   voiceOn = e.target.checked;
   if (voiceOn) { primeVoice(); speak('音声案内をオンにしました'); }
