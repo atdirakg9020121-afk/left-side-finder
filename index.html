@@ -7,8 +7,22 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; font-family: -apple-system, "Hiragino Kaku Gothic ProN", sans-serif; }
-  #map { position: absolute; top: 0; bottom: 0; left: 0; right: 0; z-index: 1; }
+  html, body { height: 100%; font-family: -apple-system, "Hiragino Kaku Gothic ProN", sans-serif; overflow: hidden; }
+
+  /* ヘディングアップ用：地図を画面より大きく取り、回転で角が欠けないようにする。
+     #mapwrap を進行方向に合わせて回転させる。 */
+  #mapwrap {
+    position: absolute; z-index: 1;
+    /* 画面中心を基準に、対角線をカバーするサイズ(150vmax)を中央配置 */
+    width: 150vmax; height: 150vmax;
+    top: 50%; left: 50%;
+    transform-origin: center center;
+    transition: transform 0.3s ease-out;
+  }
+  #map { width: 100%; height: 100%; }
+
+  /* 自分の青い三角は地図と一緒に回らず、常に画面の上(進行方向)を指す。
+     地図回転を打ち消すため、矢印アイコン自身を逆回転させる(JSで指定)。 */
 
   #status {
     position: absolute; top: 0; left: 0; right: 0; z-index: 1000;
@@ -38,14 +52,25 @@
   .dot.left { background: #2ecc71; }
   .dot.right { background: #888; }
 
-  .arrow-icon div {
-    width: 0; height: 0; border-left: 9px solid transparent; border-right: 9px solid transparent;
-    border-bottom: 22px solid #2196f3; filter: drop-shadow(0 0 2px #000);
+  /* 自分マーカー：中心の青丸＋進行方向を指す三角 */
+  .me-icon { position: relative; }
+  .me-dot {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #2196f3; border: 2px solid #fff; box-shadow: 0 0 3px rgba(0,0,0,0.5);
+  }
+  /* 三角の根元を丸の中心(アイコン中心 20,20)に合わせ、そこを軸に回す。
+     アイコン40x40の中心が(20,20)。三角は高さ16pxを上に伸ばし、根元(下端)を中心に置く。 */
+  .me-arrow {
+    position: absolute; left: 20px; top: 4px; margin-left: -8px; /* 三角(幅16)の中心を x=20(丸中心)に合わせる */
+    transform-origin: 8px 16px;          /* 三角の下端中央(=丸中心) を回転軸に */
+    width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent;
+    border-bottom: 16px solid #2196f3; filter: drop-shadow(0 0 2px rgba(0,0,0,0.6));
   }
 </style>
 </head>
 <body>
-<div id="map"></div>
+<div id="mapwrap"><div id="map"></div></div>
 <div id="status">
   <div class="row"><span>進行方向 (heading)</span><b id="heading">--</b></div>
   <div class="row"><span>方向ソース</span><b id="hsource">--</b></div>
@@ -67,7 +92,8 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 // ---------- 状態 ----------
-let map, meMarker, headingMarker;
+let map, meMarker;
+let currentRotation = 0;   // 現在の地図回転角(度)
 let myPos = null;          // {lat, lng}
 let gpsHeading = null;     // GPS由来の進行方位(度)
 let compassHeading = null; // コンパス由来の方位(度)
@@ -122,10 +148,29 @@ function currentHeading() {
 
 // ---------- 地図 ----------
 function initMap() {
-  map = L.map('map', { zoomControl: false }).setView([35.681, 139.767], 16);
+  map = L.map('map', { zoomControl: false, attributionControl: false }).setView([35.681, 139.767], 16);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19, attribution: '© OpenStreetMap'
+    maxZoom: 19
   }).addTo(map);
+  // 回転で隠れない位置に出典を小さく表示
+  L.control.attribution({ prefix: false, position: 'bottomleft' })
+    .addAttribution('© OpenStreetMap').addTo(map);
+}
+
+// 地図を進行方向が上になるよう回転する（ヘディングアップ）。
+// #mapwrap を -heading 回転 = 北をheadingだけ反時計に振る = 進行方向が画面上。
+function applyMapRotation(heading) {
+  const wrap = document.getElementById('mapwrap');
+  if (heading === null) {
+    // 方向不明なら回転なし（北上）。中央配置だけ維持。
+    wrap.style.transform = 'translate(-50%, -50%) rotate(0deg)';
+    return;
+  }
+  // 角度の急なジャンプ(359→0)で逆回転しないよう、近い表現に補正
+  let target = -heading;
+  let diff = ((target - currentRotation + 540) % 360) - 180;
+  currentRotation = currentRotation + diff;
+  wrap.style.transform = `translate(-50%, -50%) rotate(${currentRotation}deg)`;
 }
 
 // ---------- 施設取得 (Overpass / OpenStreetMap) ----------
@@ -164,25 +209,21 @@ function render() {
   document.getElementById('hsource').textContent = h.source;
   document.getElementById('speed').textContent = speed === null ? '--' : (speed * 3.6).toFixed(0) + ' km/h';
 
-  // 自分のマーカー
-  if (!meMarker) {
-    meMarker = L.circleMarker([myPos.lat, myPos.lng], {
-      radius: 8, color: '#fff', weight: 2, fillColor: '#2196f3', fillOpacity: 1
-    }).addTo(map);
-  } else {
-    meMarker.setLatLng([myPos.lat, myPos.lng]);
-  }
+  // 地図全体を進行方向が上になるよう回転（ヘディングアップ）
+  applyMapRotation(h.value);
 
-  // 進行方向の矢印
-  if (h.value !== null) {
-    const icon = L.divIcon({
-      className: 'arrow-icon',
-      html: `<div style="transform: rotate(${h.value}deg); transform-origin: center;"></div>`,
-      iconSize: [18, 22], iconAnchor: [9, 11]
-    });
-    if (!headingMarker) headingMarker = L.marker([myPos.lat, myPos.lng], { icon }).addTo(map);
-    else { headingMarker.setLatLng([myPos.lat, myPos.lng]); headingMarker.setIcon(icon); }
-  }
+  // 自分のマーカー（青い丸＋進行方向の三角）。
+  // L.marker(divIcon) なのでズームしても地図上の一点に固定される。
+  // 地図を currentRotation 回転しているので、三角を -currentRotation 戻すと常に画面の上(進行方向)を指す。
+  const arrowRot = (h.value !== null) ? -currentRotation : 0;
+  const meIcon = L.divIcon({
+    className: 'me-icon',
+    html: `<div class="me-dot"></div>` +
+          (h.value !== null ? `<div class="me-arrow" style="transform: rotate(${arrowRot}deg);"></div>` : ''),
+    iconSize: [40, 40], iconAnchor: [20, 20]
+  });
+  if (!meMarker) meMarker = L.marker([myPos.lat, myPos.lng], { icon: meIcon, interactive: false, zIndexOffset: 1000 }).addTo(map);
+  else { meMarker.setLatLng([myPos.lat, myPos.lng]); meMarker.setIcon(meIcon); }
 
   // 施設マーカー再描画
   facilityMarkers.forEach(m => map.removeLayer(m));
@@ -231,7 +272,10 @@ function applyPosition(pos) {
   if (pos.coords.heading !== null && !isNaN(pos.coords.heading)) gpsHeading = pos.coords.heading;
   if (pos.coords.speed !== null && !isNaN(pos.coords.speed)) speed = pos.coords.speed;
 
+  // ヘディングアップでは自分が常に画面中心＝回転軸。現在地に追従させる。
+  // (ユーザーのズーム量は保持。アニメ無しで即追従しガタつきを防ぐ)
   if (!meMarker) map.setView([myPos.lat, myPos.lng], 16);
+  else map.panTo([myPos.lat, myPos.lng], { animate: false });
 
   // 一定距離移動したら施設を再取得
   if (!lastFetchPos || distance(myPos.lat, myPos.lng, lastFetchPos.lat, lastFetchPos.lng) > 300) {
@@ -289,10 +333,14 @@ function startCompass() {
 }
 
 // ---------- デバッグ用にグローバル公開 ----------
+// 注: Object.assign だと getter が即時評価され値が固定されるため、defineProperties で本物のgetterにする
 Object.assign(window, {
   bearing, distance, relativeSide, currentHeading, fetchFacilities, render,
-  get _state() { return { myPos, gpsHeading, compassHeading, speed, facilities }; },
   _inject(p) { if (p.myPos) myPos = p.myPos; if ('gpsHeading' in p) gpsHeading = p.gpsHeading; if ('speed' in p) speed = p.speed; if ('compassHeading' in p) compassHeading = p.compassHeading; }
+});
+Object.defineProperties(window, {
+  _map: { get() { return map; }, configurable: true },
+  _state: { get() { return { myPos, gpsHeading, compassHeading, speed, facilities, currentRotation }; }, configurable: true }
 });
 
 // ---------- 起動 ----------
