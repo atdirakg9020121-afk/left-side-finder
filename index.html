@@ -231,6 +231,7 @@ const TUNE_DEFAULTS = {
   carTop: 85,         // 自車の下寄せ量 %（大ほど自車が画面下＝前方を広く）
   compass: 0.35,      // コンパス平滑化 0..0.9（大ほど強く均す＝震え減/遅延増）
   labelGap: 46,       // ラベル間引きの最小画面距離 px（大ほど間引く）
+  roadReach: 700,     // 「今いる道」を自車近傍に束ねる距離(m)。大=遠くまで同じ道とみなす。市街地モードで小さく・長距離モードで大きくする
 };
 let TUNE = (function () {
   try { return Object.assign({}, TUNE_DEFAULTS, JSON.parse(localStorage.getItem(TUNE_KEY)) || {}); }
@@ -383,9 +384,78 @@ function distToRoad(lat, lng, road, lat0) {
   return best;
 }
 
+// ポリライン(pts)を、自車最寄り頂点から前後それぞれ reach(m) 以内の連続区間に絞る。
+// 長い1本のway(国道など数km)も、自車近傍だけに切り詰める。これで「同じ道だが
+// ずっと先(Y字の枝や直進方向のはるか先)」の沿道店を拾わなくなる。
+function trimChainByReach(pts, lat, lng, reach) {
+  let ni = 0, nd = Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const d = distance(lat, lng, pts[i].lat, pts[i].lng);
+    if (d < nd) { nd = d; ni = i; }
+  }
+  let lo = ni, hi = ni;
+  for (let i = ni - 1; i >= 0; i--) { if (distance(lat, lng, pts[i].lat, pts[i].lng) <= reach) lo = i; else break; }
+  for (let i = ni + 1; i < pts.length; i++) { if (distance(lat, lng, pts[i].lat, pts[i].lng) <= reach) hi = i; else break; }
+  return pts.slice(lo, hi + 1);
+}
+
+// 候補way群(cands)を端点共有でグラフ化し、baseWayを起点に前後(進行方向と逆方向)へ
+// 「実際に線として連結している」区間だけを辿って chains を返す。
+// Y字・分岐では、各分岐で進行方向に最も近い1本だけを選び、それた枝(>50°)は捨てる。
+// reach(m)で頂点単位に打ち切るので、はるか先まで束ねない。
+// これが「3,4本左の道」「Y字でそれた道」の店を拾う問題への根本対策。
+function buildConnectedChains(cands, lat, lng, heading, baseWay, reach) {
+  const key = p => p.lat.toFixed(6) + ',' + p.lng.toFixed(6);
+  if (!cands.includes(baseWay)) cands = [baseWay, ...cands];
+  const ways = cands.map((w, idx) => ({ i: idx, w, a: key(w.pts[0]), b: key(w.pts[w.pts.length - 1]) }));
+  const byIdx = new Map(ways.map(x => [x.i, x]));
+  const endpoint = new Map(); // 端点キー -> そこに接続するway index 群
+  for (const x of ways) for (const k of [x.a, x.b]) {
+    if (!endpoint.has(k)) endpoint.set(k, []);
+    endpoint.get(k).push(x.i);
+  }
+  // 端点 fromKey から、向き dir に沿って連結wayを貪欲に辿る。
+  function walk(fromKey, fromIdx, dir, used) {
+    const out = [];
+    let curKey = fromKey, curDir = dir;
+    while (true) {
+      const cand = (endpoint.get(curKey) || []).filter(j => j !== fromIdx && !used.has(j));
+      if (!cand.length) break;
+      let bestJ = -1, bestDiff = 999, bestPts = null, bestEndKey = null;
+      for (const j of cand) {
+        const w = byIdx.get(j).w;
+        let pts = w.pts;
+        if (key(pts[pts.length - 1]) === curKey) pts = pts.slice().reverse(); // curKey側を始点に
+        const bdir = bearing(pts[0].lat, pts[0].lng, pts[1].lat, pts[1].lng);
+        const d = angularDiff(curDir, bdir);
+        if (d < bestDiff) { bestDiff = d; bestJ = j; bestPts = pts; bestEndKey = key(pts[pts.length - 1]); }
+      }
+      if (bestJ < 0 || bestDiff > 50) break;            // 進行方向から外れる枝→打ち切り
+      if (distance(lat, lng, bestPts[0].lat, bestPts[0].lng) > reach) break; // 接続点が既に遠い
+      used.add(bestJ);
+      out.push(trimChainByReach(bestPts, lat, lng, reach));
+      curKey = bestEndKey;
+      curDir = bearing(bestPts[bestPts.length - 2].lat, bestPts[bestPts.length - 2].lng,
+                       bestPts[bestPts.length - 1].lat, bestPts[bestPts.length - 1].lng); // カーブに追従
+      fromIdx = bestJ;
+    }
+    return out;
+  }
+  const base = byIdx.get(ways.find(x => x.w === baseWay).i);
+  const baseB = bearing(base.w.pts[0].lat, base.w.pts[0].lng,
+                        base.w.pts[base.w.pts.length - 1].lat, base.w.pts[base.w.pts.length - 1].lng);
+  const used = new Set([base.i]);
+  const fwd = walk(base.b, base.i, heading !== null ? heading : baseB, used);
+  const bwd = walk(base.a, base.i, heading !== null ? (heading + 180) % 360 : (baseB + 180) % 360, used);
+  const baseChain = trimChainByReach(base.w.pts, lat, lng, reach);
+  return [...bwd, baseChain, ...fwd].filter(ch => ch.length >= 2);
+}
+
 // 今いる道路を特定する。OSMでは同じ道路が多数のwayに分断されているため、
-// 中心となる1本を選んだあと「同じ名前のway全部」を束ねて1つの道路として返す。
-// 名前が無い道路は、向きが近く連続する近接wayを束ねる（フォールバック）。
+// 中心となる1本を選んだあと、そこから「進行方向へ実際に連結する区間」だけを束ねる。
+// 旧実装は同名/同refのwayを距離無制限に全部束ねていたため、Y字で分かれた枝や
+// 数km先の同一道路まで「今いる道」に含まれ、関係ない店を拾っていた。
+// reach(TUNE.roadReach)で自車近傍に限定し、分岐は進行方向で選ぶ。
 // 道路に乗っていなければ null。
 function findCurrentRoad(lat, lng, heading) {
   const p = toXY(lat, lng, lat);
@@ -405,39 +475,38 @@ function findCurrentRoad(lat, lng, heading) {
     if (!best || score < best.score) best = { road, score, segBearing: r.segBearing };
   }
   if (!best) return null;
-  const baseHw = best.road.hw; // 中心wayの種別。沿道判定の距離閾値に使う
-
-  // ② 中心wayと同じ道路を束ねる。
-  // 識別キーは name と ref(番号道路)の両方。郊外の国道は区間ごとに
-  // name が変わる(○○バイパス/△△街道/無名)ので、ref を共有する way も同じ道として束ねる。
+  const baseHw = best.road.hw;     // 中心wayの種別。沿道判定の距離閾値に使う
   const baseName = best.road.name;
   const baseRefs = best.road.refs;
+  const reach = TUNE.roadReach;    // 自車近傍に束ねを限定する距離(m)。モードで可変
   const hasKey = baseName || baseRefs.length;
-  let chains;
+
+  // ② 中心wayと「同じ道路」の候補を集める（同名 or 同一番号道路）。
+  //    名前/番号が無い道は、向きが平行で近接する無名wayを候補にする(フォールバック)。
+  let cands;
   if (hasKey) {
-    chains = roads.filter(r => {
+    cands = roads.filter(r => {
       if (r.pts.length < 2) return false;
-      if (baseName && r.name === baseName) return true;            // 同名
-      if (baseRefs.length && r.refs.some(x => baseRefs.includes(x))) return true; // 同一番号道路
+      if (baseName && r.name === baseName) return true;
+      if (baseRefs.length && r.refs.some(x => baseRefs.includes(x))) return true;
       return false;
-    }).map(r => r.pts);
+    });
   } else {
-    // name も ref も無い道路：中心wayと向きが平行(±25°)な近接wayを束ねる。
-    // 「近接」＝そのwayのどこかが中心wayの近く(60m以内)にある＝つながっている道。
     const baseBearing = best.segBearing;
-    chains = roads.filter(r => {
+    cands = roads.filter(r => {
       if (r.pts.length < 2) return false;
       if (r === best.road) return true;
-      if (r.name || r.refs.length) return false; // 名前/番号を持つ別の道は別物
-      // 向きの平行性
+      if (r.name || r.refs.length) return false;
       const bb = bearing(r.pts[0].lat, r.pts[0].lng, r.pts[1].lat, r.pts[1].lng);
       const d = angularDiff(baseBearing, bb);
       if (Math.min(d, 180 - d) > 25) return false;
-      // 中心wayのどこかと十分近い(連続している)か
       const rr = distToPts(toXY(r.pts[0].lat, r.pts[0].lng, lat), best.road.pts, lat);
       return rr.dist <= 60;
-    }).map(r => r.pts);
+    });
   }
+
+  // ③ 候補を「自車区間から進行方向に連結する区間」だけに絞る（Y字の枝・遠方を除外）。
+  const chains = buildConnectedChains(cands, lat, lng, heading, best.road, reach);
   return { name: baseName || baseRefs.join('/'), hw: baseHw, chains };
 }
 
@@ -815,7 +884,9 @@ function shortName(f) {
   let n = f.name || '';
   const rules = [
     [/セブン[-‐ー]?イレブン/, 'セブン'],
-    [/ファミリーマート/, 'ファミマ'],
+    // サークルK・サンクスは2018年にファミマへ統合済み（現存しない）。
+    // OSMに旧名で残っているデータはファミマとして表示する。
+    [/サークル\s*[kKＫ]|サンクス|ファミリーマート/, 'ファミマ'],
     [/ローソンストア\s*100|ローソン100/, 'ローソン100'],
     [/ナチュラルローソン/, 'ナチュラルローソン'],
     [/ローソン/, 'ローソン'],
@@ -836,7 +907,8 @@ function brandKey(f) {
   if (f.type === 'fuel') return 'gs';
   if (/セブン([-‐ー]?イレブン)?/.test(n)) return 'seven';
   if (/ローソン/.test(n))                 return 'lawson';
-  if (/ファミリーマート|ファミマ/.test(n)) return 'famima';
+  // サークルK・サンクスは2018年ファミマ統合。旧名データはファミマ扱い。
+  if (/ファミリーマート|ファミマ|サークル\s*[kKＫ]|サンクス/.test(n)) return 'famima';
   return 'other'; // ミニストップ・デイリー・セイコマ・その他コンビニ
 }
 
@@ -845,7 +917,7 @@ function brandColor(f) {
   if (f.type === 'fuel') return '#e03131';                       // ガソスタ=赤
   if (/セブン([-‐ー]?イレブン)?/.test(n)) return '#ee7b00';      // セブン=オレンジ
   if (/ローソン/.test(n))                 return '#0068b7';      // ローソン=青
-  if (/ファミリーマート|ファミマ/.test(n)) return '#00a040';     // ファミマ=緑
+  if (/ファミリーマート|ファミマ|サークル\s*[kKＫ]|サンクス/.test(n)) return '#00a040'; // ファミマ=緑（旧サークルK/サンクス含む）
   if (/ミニストップ/.test(n))             return '#f6c700';      // ミニストップ=黄
   if (/デイリーヤマザキ/.test(n))     return '#e8531b';   // デイリー=朱
   if (/セイコーマート/.test(n))       return '#1b9e5a';   // セイコマ=深緑
@@ -1052,7 +1124,7 @@ function setupTuneUI() {
 Object.assign(window, {
   bearing, distance, relativeSide, relativeAngle, angularDiff, currentHeading, fetchFacilities, render, doRender,
   shortName, spokenDistance, announceNearby, brandColor, openState,
-  distToRoad, distToPts, findCurrentRoad, pointSegDist, toXY, parseOverpass,
+  distToRoad, distToPts, findCurrentRoad, buildConnectedChains, trimChainByReach, pointSegDist, toXY, parseOverpass,
   roadSideThresh, onRoadMax, smoothCompass, applyCarTop, saveTune,
   _setCompass(v) { compassHeading = v; },
   _setTune(k, v) { TUNE[k] = v; },
