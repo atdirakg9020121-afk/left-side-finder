@@ -190,6 +190,7 @@
       <option value="2000">2km</option>
       <option value="3000">3km</option>
       <option value="5000">5km</option>
+      <option value="10000">10km</option>
     </select>
   </label>
   <div class="legend" id="legend" title="タップで表示/非表示を切替">
@@ -237,7 +238,7 @@ const lerp = (a, b, t) => a + (b - a) * t;
 function autoRoadReach() { return Math.round(lerp(300, 1200, speedFactor())); } // 「今いる道」を束ねる距離
 function autoVoiceNear() { return Math.round(lerp(250, 450, speedFactor())); }  // 音声で予告する手前距離
 function autoVoiceReset() { return autoVoiceNear() + 150; }                     // 再通知に戻す距離(NEARより外)
-function autoRadius()    { return Math.round(lerp(1000, 3000, speedFactor())); } // 表示範囲(「自動」選択時のみ)
+function autoRadius()    { return Math.round(lerp(5000, 10000, speedFactor())); } // 表示範囲(「自動」選択時のみ。市街地5km〜長距離10km)
 let myPos = null;          // {lat, lng}
 let gpsHeading = null;     // GPS由来の進行方位(度)
 let compassHeading = null; // コンパス由来の方位(度)。平滑化後の値
@@ -666,7 +667,7 @@ function rotationTick() {
 }
 
 // ---------- 施設取得 (Overpass / OpenStreetMap) ----------
-const FETCH_RADIUS = 5000; // 施設の取得半径(m)。範囲セレクトの最大(5km)に合わせる。表示はこの中から距離フィルタで絞る
+const FETCH_RADIUS = 10000; // 施設の取得半径(m)。範囲セレクトの最大(10km)に合わせる。表示はこの中から距離フィルタで絞る
 const ROAD_FETCH_RADIUS = 600; // 道路の取得半径(m)。「今いる道路」特定が目的なので近場だけで十分・軽い
 // Overpassのミラー一覧。1つが混雑/エラーでも順に次を試す（取得失敗が頻発する問題への対策）。
 // 実車検証で overpass-api.de は混雑時タイムアウトや稀に406を返すことがあったため複数用意。
