@@ -184,10 +184,10 @@
   <label><input type="checkbox" id="showRight" checked> 右も表示</label>
   <label>範囲
     <select id="radius">
-      <option value="500" selected>500m</option>
+      <option value="500">500m</option>
       <option value="1000">1km</option>
       <option value="2000">2km</option>
-      <option value="3000">3km</option>
+      <option value="3000" selected>3km</option>
       <option value="5000">5km</option>
     </select>
   </label>
@@ -244,6 +244,9 @@ let facilityMarkers = [];
 let facilities = [];       // 取得済み施設 [{lat,lng,name,type}]
 let roads = [];            // 取得済み道路 [{name, pts:[{lat,lng},...]}] pts=ポリラインの頂点列
 let currentRoad = null;    // 今いる道路 {road, ...} （rebuildFacilitiesで毎回特定）
+// タゲ(次の左側施設)・音声案内が参照する「今いる道」。表示が全店モードでも
+// タゲと音声は常に道沿いに限定したいので currentRoad とは別に保持する。
+let targetRoad = null;
 let onlyCurrentRoad = true; // 「今いる道路だけ」表示するか
 // 道路ライン中心からこの距離(m)以内の施設だけを「今いる道路沿い」とみなす。
 // OSMの道路ラインは中心線で、店は駐車場/歩道の奥(建物)にあるため中心線から離れる。
@@ -551,10 +554,11 @@ function announceNearby(heading) {
     if (dist > VOICE_RESET) { announced[key] = false; continue; }
 
     if (!activeBrands.has(brandKey(f))) continue; // 凡例で非表示のブランドは読み上げない
-    // 「今いる道路だけ」表示中は、その道沿いの店だけ読み上げる（地図表示と揃える）
-    if (currentRoad) {
-      const rd = distToRoad(f.lat, f.lng, currentRoad, myPos.lat).dist;
-      if (rd > roadSideThresh(currentRoad.hw)) continue;
+    // 読み上げは常に「今いる道沿い」の店だけ（タゲと同じ思想・地図表示とも揃える）。
+    // targetRoad は全店表示中でも特定済み（rebuildFacilitiesで設定）。
+    if (targetRoad) {
+      const rd = distToRoad(f.lat, f.lng, targetRoad, myPos.lat).dist;
+      if (rd > roadSideThresh(targetRoad.hw)) continue;
     }
 
     const ang = relativeAngle(heading, bearing(myPos.lat, myPos.lng, f.lat, f.lng));
@@ -704,6 +708,17 @@ function loadCache() {
   } catch (e) { return false; }
 }
 
+// shop=convenience には、一般客が立ち寄れない構内売店も混ざる
+// （大学生協の購買会、研究所・企業の職員生協など）。運転中に左折で寄る
+// 用途では完全にノイズなので名前で除外する。実車検証で実際に出た例：
+//   「青山学院購買会」「宇宙科学研究所生活協同組合店舗」。
+// 正規のコンビニ(スリーエフ・個人経営コンビニ等)まで消さないよう、
+// 構内売店に特徴的な語だけを狙い撃ちする（広く shop=convenience を疑わない）。
+function isNonPublicStore(name) {
+  if (!name) return false;
+  return /購買(会|部|所)|生協|生活協同組合|大学.*売店|学生会館|職員.*(食堂|売店)|学食|社員食堂/.test(name);
+}
+
 // Overpassの応答(node/way混在)を施設配列と道路配列に分解する。
 function parseOverpass(data) {
   // ノード座標表（way頂点の解決用）
@@ -714,6 +729,7 @@ function parseOverpass(data) {
   facilities = data.elements
     .filter(e => e.type === 'node' && e.tags &&
             (e.tags.shop === 'convenience' || e.tags.amenity === 'fuel'))
+    .filter(e => !isNonPublicStore(e.tags.name)) // 大学購買会・職員生協など構内売店を除外
     .map(e => ({
       lat: e.lat, lng: e.lon,
       name: e.tags.name || (e.tags.amenity === 'fuel' ? 'ガソリンスタンド' : 'コンビニ'),
@@ -800,6 +816,10 @@ function rebuildFacilities(heading) {
   // 特定できないとき(交差点上・道路データ未取得など)は従来通り全部出す。
   currentRoad = (onlyCurrentRoad && roads.length)
     ? findCurrentRoad(myPos.lat, myPos.lng, heading) : null;
+  // 「次の左側施設」(タゲ)は、表示が全店モードでも常に今いる道沿いに限定したい。
+  // そこで currentRoad が無い時(=全店表示)でもタゲ判定用に道路を特定しておく。
+  // targetRoad はグローバル：音声案内(announceNearby)も同じ道を参照して一貫させる。
+  targetRoad = currentRoad || (roads.length ? findCurrentRoad(myPos.lat, myPos.lng, heading) : null);
 
   if (heading !== null) {
     const labelRot = -currentRotation; // ラベルを水平に保つ逆回転
@@ -822,8 +842,16 @@ function rebuildFacilities(heading) {
       const isLeft = ang < 0;
       if (isLeft) {
         leftCount++;
-        // 前方(真横より前)の左側で最も近いものを「次の左側施設」とする
-        if (Math.abs(ang) <= 100 && (!nearestLeft || dist < nearestLeft.dist)) {
+        // 「次の左側施設」(タゲ)＝今いる道沿いの・前方寄りの・左側で最も近い店。
+        // ・前方寄り: 真横より前(±90°以内)。通り過ぎた後方の店はタゲにしない。
+        // ・道沿い限定: 全店表示中でも、別の道沿いの店はタゲにしない(targetRoadで判定)。
+        const forward = Math.abs(ang) <= 90;
+        let onTargetRoad = true;
+        if (targetRoad) {
+          const rd = distToRoad(f.lat, f.lng, targetRoad, myPos.lat).dist;
+          onTargetRoad = rd <= roadSideThresh(targetRoad.hw);
+        }
+        if (forward && onTargetRoad && (!nearestLeft || dist < nearestLeft.dist)) {
           nearestLeft = { f, dist };
         }
       }
@@ -882,17 +910,18 @@ function rebuildFacilities(heading) {
 // コンビニ/GSのチェーン名を運転中に読みやすい短縮形にする
 function shortName(f) {
   let n = f.name || '';
+  // OSMは英語表記の店も多い(7-Eleven/FamilyMart/Lawson/MINISTOP等)ので併記。
   const rules = [
-    [/セブン[-‐ー]?イレブン/, 'セブン'],
+    [/セブン[-‐ー]?イレブン|(seven|7)[-\s]?eleven/i, 'セブン'],
     // サークルK・サンクスは2018年にファミマへ統合済み（現存しない）。
     // OSMに旧名で残っているデータはファミマとして表示する。
-    [/サークル\s*[kKＫ]|サンクス|ファミリーマート/, 'ファミマ'],
-    [/ローソンストア\s*100|ローソン100/, 'ローソン100'],
-    [/ナチュラルローソン/, 'ナチュラルローソン'],
-    [/ローソン/, 'ローソン'],
-    [/ミニストップ/, 'ミニストップ'],
-    [/デイリーヤマザキ/, 'デイリー'],
-    [/セイコーマート/, 'セイコマ'],
+    [/サークル\s*[kKＫ]|サンクス|ファミリーマート|familymart|family\s*mart|circle\s*k/i, 'ファミマ'],
+    [/ローソンストア\s*100|ローソン100|lawson\s*store\s*100/i, 'ローソン100'],
+    [/ナチュラルローソン|natural\s*lawson/i, 'ナチュラルローソン'],
+    [/ローソン|lawson/i, 'ローソン'],
+    [/ミニストップ|ministop/i, 'ミニストップ'],
+    [/デイリーヤマザキ|daily\s*yamazaki/i, 'デイリー'],
+    [/セイコーマート|seicomart/i, 'セイコマ'],
   ];
   for (const [re, s] of rules) if (re.test(n)) return s;
   // ガソスタや無名はそのまま(長ければ省略)
@@ -905,22 +934,22 @@ function shortName(f) {
 function brandKey(f) {
   const n = f.name || '';
   if (f.type === 'fuel') return 'gs';
-  if (/セブン([-‐ー]?イレブン)?/.test(n)) return 'seven';
-  if (/ローソン/.test(n))                 return 'lawson';
+  if (/セブン([-‐ー]?イレブン)?|(seven|7)[-\s]?eleven/i.test(n)) return 'seven';
+  if (/ローソン|lawson/i.test(n))         return 'lawson';
   // サークルK・サンクスは2018年ファミマ統合。旧名データはファミマ扱い。
-  if (/ファミリーマート|ファミマ|サークル\s*[kKＫ]|サンクス/.test(n)) return 'famima';
+  if (/ファミリーマート|ファミマ|サークル\s*[kKＫ]|サンクス|familymart|family\s*mart|circle\s*k/i.test(n)) return 'famima';
   return 'other'; // ミニストップ・デイリー・セイコマ・その他コンビニ
 }
 
 function brandColor(f) {
   const n = f.name || '';
   if (f.type === 'fuel') return '#e03131';                       // ガソスタ=赤
-  if (/セブン([-‐ー]?イレブン)?/.test(n)) return '#ee7b00';      // セブン=オレンジ
-  if (/ローソン/.test(n))                 return '#0068b7';      // ローソン=青
-  if (/ファミリーマート|ファミマ|サークル\s*[kKＫ]|サンクス/.test(n)) return '#00a040'; // ファミマ=緑（旧サークルK/サンクス含む）
-  if (/ミニストップ/.test(n))             return '#f6c700';      // ミニストップ=黄
-  if (/デイリーヤマザキ/.test(n))     return '#e8531b';   // デイリー=朱
-  if (/セイコーマート/.test(n))       return '#1b9e5a';   // セイコマ=深緑
+  if (/セブン([-‐ー]?イレブン)?|(seven|7)[-\s]?eleven/i.test(n)) return '#ee7b00';      // セブン=オレンジ
+  if (/ローソン|lawson/i.test(n))         return '#0068b7';      // ローソン=青
+  if (/ファミリーマート|ファミマ|サークル\s*[kKＫ]|サンクス|familymart|family\s*mart|circle\s*k/i.test(n)) return '#00a040'; // ファミマ=緑（旧サークルK/サンクス含む）
+  if (/ミニストップ|ministop/i.test(n))   return '#f6c700';      // ミニストップ=黄
+  if (/デイリーヤマザキ|daily\s*yamazaki/i.test(n)) return '#e8531b';   // デイリー=朱
+  if (/セイコーマート|seicomart/i.test(n)) return '#1b9e5a';   // セイコマ=深緑
   return '#7a5ad6';                                        // その他コンビニ=紫
 }
 
@@ -1125,7 +1154,7 @@ Object.assign(window, {
   bearing, distance, relativeSide, relativeAngle, angularDiff, currentHeading, fetchFacilities, render, doRender,
   shortName, spokenDistance, announceNearby, brandColor, openState,
   distToRoad, distToPts, findCurrentRoad, buildConnectedChains, trimChainByReach, pointSegDist, toXY, parseOverpass,
-  roadSideThresh, onRoadMax, smoothCompass, applyCarTop, saveTune,
+  roadSideThresh, onRoadMax, smoothCompass, applyCarTop, saveTune, isNonPublicStore,
   _setCompass(v) { compassHeading = v; },
   _setTune(k, v) { TUNE[k] = v; },
   _setFacDirty() { facDirty = true; },
@@ -1136,7 +1165,7 @@ Object.assign(window, {
 });
 Object.defineProperties(window, {
   _map: { get() { return map; }, configurable: true },
-  _state: { get() { return { myPos, gpsHeading, compassHeading, compassRaw, speed, facilities, roads, currentRoad, onlyCurrentRoad, currentRotation, facBuildCount, TUNE }; }, configurable: true }
+  _state: { get() { return { myPos, gpsHeading, compassHeading, compassRaw, speed, facilities, roads, currentRoad, targetRoad, onlyCurrentRoad, currentRotation, facBuildCount, TUNE }; }, configurable: true }
 });
 
 // ---------- 起動 ----------
