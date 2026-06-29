@@ -668,7 +668,32 @@ function rotationTick() {
 // ---------- 施設取得 (Overpass / OpenStreetMap) ----------
 const FETCH_RADIUS = 5000; // 施設の取得半径(m)。範囲セレクトの最大(5km)に合わせる。表示はこの中から距離フィルタで絞る
 const ROAD_FETCH_RADIUS = 600; // 道路の取得半径(m)。「今いる道路」特定が目的なので近場だけで十分・軽い
+// Overpassのミラー一覧。1つが混雑/エラーでも順に次を試す（取得失敗が頻発する問題への対策）。
+// 実車検証で overpass-api.de は混雑時タイムアウトや稀に406を返すことがあったため複数用意。
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  'https://overpass.openstreetmap.ru/api/interpreter',
+];
+let fetchInFlight = false;  // 二重取得の防止（移動のたびに呼ばれるため）
+let fetchSeq = 0;           // 最新リクエストだけ採用するための世代番号
+
+// fetch にタイムアウトを付ける（AbortController）。圏外で永久に待たないように。
+async function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchFacilities(lat, lng) {
+  if (fetchInFlight) return; // 取得中なら重ねない（次の移動で再取得される）
+  fetchInFlight = true;
+  const seq = ++fetchSeq;
   // 施設(node)と道路(way)を1リクエストで取得。
   // way の頂点座標も要るので「>;(子ノード展開) + out skel」を付ける。
   const query = `
@@ -682,27 +707,47 @@ async function fetchFacilities(lat, lng) {
     out body;
     >;
     out skel qt;`;
-  try {
-    const res = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST', body: query
-    });
-    const data = await res.json();
+
+  // 各ミラーを順に試す。HTTPエラー(406/429/5xx)やタイムアウトは次のミラーへ。
+  let data = null, lastErr = null;
+  for (let i = 0; i < OVERPASS_MIRRORS.length; i++) {
+    const url = OVERPASS_MIRRORS[i];
+    try {
+      const res = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain', 'Accept': 'application/json' },
+        body: query
+      }, 20000);
+      if (!res.ok) { lastErr = new Error('HTTP ' + res.status); continue; } // 次のミラーへ
+      const json = await res.json();
+      if (!json || !Array.isArray(json.elements)) { lastErr = new Error('bad json'); continue; }
+      data = json;
+      break;
+    } catch (err) {
+      lastErr = err; // タイムアウト/ネットワーク/中断。次のミラーへ
+    }
+  }
+
+  fetchInFlight = false;
+  if (seq !== fetchSeq) return; // 取得中にもっと新しい要求が来ていたら破棄（古い結果で上書きしない）
+
+  if (data) {
     parseOverpass(data);
     lastFetchPos = { lat, lng };
     facDirty = true; // 新しい施設データなのでピンを必ず作り直す
     saveCache(lat, lng);   // オフライン耐性：成功データを保存（トンネル・圏外で消えないように）
     setMsg('');
     render();
-  } catch (err) {
-    // トンネル・圏外・サーバ混雑など。取得済みの施設(facilities)はそのまま残すので
-    // 走行中に一瞬電波が切れてもピンは消えない。初回失敗やリロード直後で施設が空の
-    // ときだけ、前回成功時のキャッシュを復元して「真っ白」を防ぐ。
+  } else {
+    // 全ミラー失敗（トンネル・圏外・全サーバ混雑など）。取得済みの施設(facilities)は
+    // そのまま残すので、走行中に一瞬電波が切れてもピンは消えない。初回失敗やリロード
+    // 直後で施設が空のときだけ、前回成功時のキャッシュを復元して「真っ白」を防ぐ。
     if (!facilities.length && loadCache()) {
       facDirty = true;
       setMsg('オフライン表示中（前回取得した施設を表示）。電波が戻ると自動更新します。');
       render();
     } else {
-      setMsg('施設データ取得に失敗（電波/サーバ混雑）。少し待って移動すると再取得します。');
+      setMsg('施設データ取得に失敗（電波/サーバ混雑）。移動すると自動で再取得します。');
     }
   }
 }
