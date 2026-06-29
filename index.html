@@ -184,10 +184,11 @@
   <label><input type="checkbox" id="showRight" checked> 右も表示</label>
   <label>範囲
     <select id="radius">
+      <option value="auto" selected>自動</option>
       <option value="500">500m</option>
       <option value="1000">1km</option>
       <option value="2000">2km</option>
-      <option value="3000" selected>3km</option>
+      <option value="3000">3km</option>
       <option value="5000">5km</option>
     </select>
   </label>
@@ -214,10 +215,29 @@ let voicePrimed = false;   // iOS等で音声が解禁済みか
 const announced = {};      // 施設キー -> 通知済みフラグ（再接近でリセット）
 let lastSpeakAt = 0;       // 最後に発話した時刻(ms)
 // 音声案内のしきい値
-const VOICE_NEAR = 250;    // この距離(m)以内で通知
-const VOICE_RESET = 400;   // この距離(m)より離れたら再通知可に戻す
 const VOICE_COOLDOWN = 3500; // 連続発話の最小間隔(ms)
 const VOICE_FWD_DEG = 100; // 進行方向からこの角度以内を「前方」とみなす
+
+// ---------- 速度連動の自動調整（市街地⇔長距離モードを速度で無段階に切替）----------
+// 信号が多く店が密集する市街地(遅い)では近場だけを・流れの速いバイパス(速い)では
+// 先まで見たい。手動モード切替は運転中に危険なので、GPS速度から各パラメータを
+// 連続補間して自動で切り替える。下UIを増やさずに市街地/長距離モードを実現する。
+const SPEED_SLOW_KMH = 15;  // これ以下は完全に市街地寄り(t=0)
+const SPEED_FAST_KMH = 55;  // これ以上は完全に長距離寄り(t=1)
+// 速度(km/h)→ 0(市街地)..1(長距離) の係数。speed未取得時は中庸(0.4)。
+function speedFactor() {
+  if (speed === null) return 0.4;
+  const kmh = speed * 3.6;
+  if (kmh <= SPEED_SLOW_KMH) return 0;
+  if (kmh >= SPEED_FAST_KMH) return 1;
+  return (kmh - SPEED_SLOW_KMH) / (SPEED_FAST_KMH - SPEED_SLOW_KMH);
+}
+const lerp = (a, b, t) => a + (b - a) * t;
+// 各パラメータの市街地値→長距離値（速度で補間）
+function autoRoadReach() { return Math.round(lerp(300, 1200, speedFactor())); } // 「今いる道」を束ねる距離
+function autoVoiceNear() { return Math.round(lerp(250, 450, speedFactor())); }  // 音声で予告する手前距離
+function autoVoiceReset() { return autoVoiceNear() + 150; }                     // 再通知に戻す距離(NEARより外)
+function autoRadius()    { return Math.round(lerp(1000, 3000, speedFactor())); } // 表示範囲(「自動」選択時のみ)
 let myPos = null;          // {lat, lng}
 let gpsHeading = null;     // GPS由来の進行方位(度)
 let compassHeading = null; // コンパス由来の方位(度)。平滑化後の値
@@ -231,7 +251,6 @@ const TUNE_DEFAULTS = {
   carTop: 85,         // 自車の下寄せ量 %（大ほど自車が画面下＝前方を広く）
   compass: 0.35,      // コンパス平滑化 0..0.9（大ほど強く均す＝震え減/遅延増）
   labelGap: 46,       // ラベル間引きの最小画面距離 px（大ほど間引く）
-  roadReach: 700,     // 「今いる道」を自車近傍に束ねる距離(m)。大=遠くまで同じ道とみなす。市街地モードで小さく・長距離モードで大きくする
 };
 let TUNE = (function () {
   try { return Object.assign({}, TUNE_DEFAULTS, JSON.parse(localStorage.getItem(TUNE_KEY)) || {}); }
@@ -458,7 +477,7 @@ function buildConnectedChains(cands, lat, lng, heading, baseWay, reach) {
 // 中心となる1本を選んだあと、そこから「進行方向へ実際に連結する区間」だけを束ねる。
 // 旧実装は同名/同refのwayを距離無制限に全部束ねていたため、Y字で分かれた枝や
 // 数km先の同一道路まで「今いる道」に含まれ、関係ない店を拾っていた。
-// reach(TUNE.roadReach)で自車近傍に限定し、分岐は進行方向で選ぶ。
+// reach(autoRoadReach・速度連動)で自車近傍に限定し、分岐は進行方向で選ぶ。
 // 道路に乗っていなければ null。
 function findCurrentRoad(lat, lng, heading) {
   const p = toXY(lat, lng, lat);
@@ -481,7 +500,7 @@ function findCurrentRoad(lat, lng, heading) {
   const baseHw = best.road.hw;     // 中心wayの種別。沿道判定の距離閾値に使う
   const baseName = best.road.name;
   const baseRefs = best.road.refs;
-  const reach = TUNE.roadReach;    // 自車近傍に束ねを限定する距離(m)。モードで可変
+  const reach = autoRoadReach();   // 自車近傍に束ねを限定する距離(m)。速度で自動(市街地300〜長距離1200)
   const hasKey = baseName || baseRefs.length;
 
   // ② 中心wayと「同じ道路」の候補を集める（同名 or 同一番号道路）。
@@ -544,6 +563,9 @@ function primeVoice() {
 function announceNearby(heading) {
   if (!voiceOn || heading === null || !myPos) return;
   const now = Date.now();
+  // 通知/再通知の距離は速度連動（速いほど早めに予告）。ループ前に一度算出。
+  const voiceNear = autoVoiceNear();
+  const voiceReset = autoVoiceReset();
 
   // まず候補を集める（左・前方・近い・未通知）
   let best = null;
@@ -551,7 +573,7 @@ function announceNearby(heading) {
     const dist = distance(myPos.lat, myPos.lng, f.lat, f.lng);
     const key = facKey(f);
     // 離れたら通知済みフラグを解除（再接近で再通知できるように）
-    if (dist > VOICE_RESET) { announced[key] = false; continue; }
+    if (dist > voiceReset) { announced[key] = false; continue; }
 
     if (!activeBrands.has(brandKey(f))) continue; // 凡例で非表示のブランドは読み上げない
     // 読み上げは常に「今いる道沿い」の店だけ（タゲと同じ思想・地図表示とも揃える）。
@@ -565,7 +587,7 @@ function announceNearby(heading) {
     const isLeft = ang < 0;
     const isForward = Math.abs(ang) <= VOICE_FWD_DEG;
     if (!isLeft || !isForward) continue;
-    if (dist > VOICE_NEAR) continue;
+    if (dist > voiceNear) continue;
     if (announced[key]) continue;
 
     // 最も近いものを1つだけ選ぶ
@@ -808,7 +830,9 @@ function rebuildFacilities(heading) {
   facilityMarkers.forEach(m => map.removeLayer(m));
   facilityMarkers = [];
   const showRight = document.getElementById('showRight').checked;
-  const maxDist = Number(document.getElementById('radius').value); // 距離フィルタ(m)
+  // 表示範囲。「自動」なら速度連動(市街地1km〜長距離3km)、それ以外は選んだ固定値。
+  const radiusSel = document.getElementById('radius').value;
+  const maxDist = radiusSel === 'auto' ? autoRadius() : Number(radiusSel);
   let leftCount = 0;
   let nearestLeft = null; // 進行方向(前方)で一番近い左側施設 {f, dist}
 
@@ -1026,7 +1050,11 @@ function geoErrorText(err) {
 function applyPosition(pos) {
   myPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
   if (pos.coords.heading !== null && !isNaN(pos.coords.heading)) gpsHeading = pos.coords.heading;
+  // 速度連動の自動調整(reach/radius/voice)に効くので、速度帯が一定以上変わったら
+  // 施設ピンを作り直す（速いのに近場だけ…等のズレ防止）。
+  const prevFactor = speedFactor();
   if (pos.coords.speed !== null && !isNaN(pos.coords.speed)) speed = pos.coords.speed;
+  if (Math.abs(speedFactor() - prevFactor) >= 0.1) facDirty = true;
 
   // ヘディングアップでは自分が常に画面中心＝回転軸。現在地に追従させる。
   // (ユーザーのズーム量は保持。アニメ無しで即追従しガタつきを防ぐ)
@@ -1155,6 +1183,7 @@ Object.assign(window, {
   shortName, spokenDistance, announceNearby, brandColor, openState,
   distToRoad, distToPts, findCurrentRoad, buildConnectedChains, trimChainByReach, pointSegDist, toXY, parseOverpass,
   roadSideThresh, onRoadMax, smoothCompass, applyCarTop, saveTune, isNonPublicStore,
+  speedFactor, autoRoadReach, autoVoiceNear, autoVoiceReset, autoRadius,
   _setCompass(v) { compassHeading = v; },
   _setTune(k, v) { TUNE[k] = v; },
   _setFacDirty() { facDirty = true; },
